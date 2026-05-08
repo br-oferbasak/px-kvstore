@@ -13,10 +13,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.settings import settings
 from ..metrics.registry import registry
+from .. import tracing
 
 def _http_get_json(url: str, timeout: float) -> Tuple[int, Any, str]:
+    headers: Dict[str, str] = {}
+    tracing.inject_headers(headers)
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
             if not text:
@@ -34,10 +38,12 @@ def _http_get_json(url: str, timeout: float) -> Tuple[int, Any, str]:
 
 def _http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Tuple[int, str]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    tracing.inject_headers(headers)
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -92,56 +98,71 @@ class ReplicationManager:
         logging.info("Performing initial full sync from leader: %s", self.leader_addr)
         max_retries = 5
         for i in range(max_retries):
-            try:
-                url = f"http://{self.leader_addr}/replication/snapshot?format=ndjson&compress=gzip"
-                req = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"}, method="GET")
-                with urllib.request.urlopen(req, timeout=10.0) as resp:
-                    if int(getattr(resp, "status", 0) or 0) != 200:
-                        raise RuntimeError(f"snapshot status={getattr(resp, 'status', 0)}")
-                    stream: Any = resp
-                    if (resp.headers.get("Content-Encoding", "") or "").lower() == "gzip":
-                        stream = gzip.GzipFile(fileobj=resp, mode="rb")
-                    first = stream.readline()
-                    if not first:
-                        raise RuntimeError("empty snapshot stream")
-                    meta = json.loads(first.decode("utf-8", errors="replace"))
-                    lsn = int(meta.get("_lsn", 0) or 0)
-                    while True:
-                        line = stream.readline()
-                        if not line:
-                            break
-                        rec = json.loads(line.decode("utf-8", errors="replace"))
-                        shard_idx = rec.get("shard")
-                        state = rec.get("state")
-                        if shard_idx is None or state is None:
-                            continue
-                        idx = int(shard_idx)
-                        if 0 <= idx < len(self.store._shards):
-                            self.store._shards[idx].load_state(state)
-                    self._last_applied_lsn = lsn
-                    self._last_applied_at = time.time()
-                    self._known_leader_lsn = max(self._known_leader_lsn, lsn)
-                    logging.info("Initial full sync completed successfully. LSN: %d", lsn)
-                    return
-            except Exception as e:
+            with tracing.start_span(
+                "replication.follower.initial_full_sync",
+                attributes={
+                    "pxkv.replication.leader": self.leader_addr,
+                    "pxkv.replication.attempt": i + 1,
+                },
+                kind="client",
+            ) as sync_span:
                 try:
-                    url = f"http://{self.leader_addr}/replication/snapshot"
-                    status, data, text = _http_get_json(url, timeout=5.0)
-                    if status == 200 and isinstance(data, dict):
-                        lsn = int(data.pop("_lsn", 0) or 0)
-                        self.store.load(data)
+                    url = f"http://{self.leader_addr}/replication/snapshot?format=ndjson&compress=gzip"
+                    req_headers = {"Accept-Encoding": "gzip"}
+                    tracing.inject_headers(req_headers)
+                    req = urllib.request.Request(url, headers=req_headers, method="GET")
+                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                        status = int(getattr(resp, "status", 0) or 0)
+                        tracing.set_attribute(sync_span, "http.status_code", status)
+                        if status != 200:
+                            raise RuntimeError(f"snapshot status={status}")
+                        stream: Any = resp
+                        if (resp.headers.get("Content-Encoding", "") or "").lower() == "gzip":
+                            stream = gzip.GzipFile(fileobj=resp, mode="rb")
+                        first = stream.readline()
+                        if not first:
+                            raise RuntimeError("empty snapshot stream")
+                        meta = json.loads(first.decode("utf-8", errors="replace"))
+                        lsn = int(meta.get("_lsn", 0) or 0)
+                        while True:
+                            line = stream.readline()
+                            if not line:
+                                break
+                            rec = json.loads(line.decode("utf-8", errors="replace"))
+                            shard_idx = rec.get("shard")
+                            state = rec.get("state")
+                            if shard_idx is None or state is None:
+                                continue
+                            idx = int(shard_idx)
+                            if 0 <= idx < len(self.store._shards):
+                                self.store._shards[idx].load_state(state)
                         self._last_applied_lsn = lsn
                         self._last_applied_at = time.time()
                         self._known_leader_lsn = max(self._known_leader_lsn, lsn)
+                        tracing.set_attribute(sync_span, "pxkv.replication.last_applied_lsn", lsn)
                         logging.info("Initial full sync completed successfully. LSN: %d", lsn)
                         return
-                    logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
-                except Exception:
-                    logging.warning("Initial full sync attempt %d failed: %s", i + 1, e)
-            
+                except Exception as e:
+                    tracing.set_status_error(sync_span, str(e))
+                    try:
+                        url = f"http://{self.leader_addr}/replication/snapshot"
+                        status, data, text = _http_get_json(url, timeout=5.0)
+                        if status == 200 and isinstance(data, dict):
+                            lsn = int(data.pop("_lsn", 0) or 0)
+                            self.store.load(data)
+                            self._last_applied_lsn = lsn
+                            self._last_applied_at = time.time()
+                            self._known_leader_lsn = max(self._known_leader_lsn, lsn)
+                            tracing.set_attribute(sync_span, "pxkv.replication.last_applied_lsn", lsn)
+                            logging.info("Initial full sync completed successfully (json fallback). LSN: %d", lsn)
+                            return
+                        logging.warning("Initial full sync attempt %d failed: %s %s", i + 1, status, text)
+                    except Exception:
+                        logging.warning("Initial full sync attempt %d failed: %s", i + 1, e)
+
             if i < max_retries - 1:
                 time.sleep(2.0)
-        
+
         logging.error("Initial full sync failed after %d retries", max_retries)
 
     def stop(self):
@@ -228,60 +249,104 @@ class ReplicationManager:
                         continue
                 registry.observe_replication_queue(depth=self.replication_queue.qsize(), max_size=self._queue_max)
 
-                for follower in self.followers:
-                    url = f"http://{follower}/replication/sync"
-                    leader_lsn = int(getattr(self.store._wal, "_lsn", 0) or 0)
-                    status, text = _http_post_json(url, {"changes": changes, "leader_lsn": leader_lsn}, timeout=2.0)
-                    ack_lsn = self._follower_ack_lsn.get(follower, 0)
-                    if status == 200:
-                        try:
-                            payload = json.loads(text) if text else {}
-                        except ValueError:
-                            payload = {}
-                        ack_lsn = int(payload.get("last_applied_lsn", ack_lsn) or ack_lsn)
-                        self._follower_ack_lsn[follower] = ack_lsn
-                        registry.observe_replication_ack(
-                            follower=follower,
-                            leader_lsn=leader_lsn,
-                            ack_lsn=ack_lsn,
-                            ok=True,
-                        )
-                        continue
-                    if status not in (200, 0):
-                        logging.warning("Follower sync returned %s for %s", status, follower)
-                    registry.observe_replication_ack(
-                        follower=follower,
-                        leader_lsn=leader_lsn,
-                        ack_lsn=ack_lsn,
-                        ok=False,
-                        error=f"status={status} detail={text[:120]}",
-                    )
+                leader_lsn = int(getattr(self.store._wal, "_lsn", 0) or 0)
+                with tracing.start_span(
+                    "replication.leader.dispatch_batch",
+                    attributes={
+                        "pxkv.replication.batch_size": len(changes),
+                        "pxkv.replication.followers": len(self.followers),
+                        "pxkv.replication.leader_lsn": leader_lsn,
+                    },
+                    kind="producer",
+                ):
+                    for follower in self.followers:
+                        with tracing.start_span(
+                            "replication.leader.sync_follower",
+                            attributes={
+                                "pxkv.replication.follower": follower,
+                                "pxkv.replication.batch_size": len(changes),
+                                "pxkv.replication.leader_lsn": leader_lsn,
+                            },
+                            kind="client",
+                        ) as fspan:
+                            url = f"http://{follower}/replication/sync"
+                            status, text = _http_post_json(url, {"changes": changes, "leader_lsn": leader_lsn}, timeout=2.0)
+                            tracing.set_attribute(fspan, "http.status_code", status)
+                            ack_lsn = self._follower_ack_lsn.get(follower, 0)
+                            if status == 200:
+                                try:
+                                    payload = json.loads(text) if text else {}
+                                except ValueError:
+                                    payload = {}
+                                ack_lsn = int(payload.get("last_applied_lsn", ack_lsn) or ack_lsn)
+                                self._follower_ack_lsn[follower] = ack_lsn
+                                tracing.set_attribute(fspan, "pxkv.replication.ack_lsn", ack_lsn)
+                                registry.observe_replication_ack(
+                                    follower=follower,
+                                    leader_lsn=leader_lsn,
+                                    ack_lsn=ack_lsn,
+                                    ok=True,
+                                )
+                                continue
+                            if status not in (200, 0):
+                                logging.warning("Follower sync returned %s for %s", status, follower)
+                            tracing.set_status_error(fspan, f"sync failed status={status}")
+                            registry.observe_replication_ack(
+                                follower=follower,
+                                leader_lsn=leader_lsn,
+                                ack_lsn=ack_lsn,
+                                ok=False,
+                                error=f"status={status} detail={text[:120]}",
+                            )
             except Exception as e:
                 logging.error("Leader replication error: %s", e)
 
     def _follower_replication_loop(self):
         self._initial_full_sync()
-        
+
         while not self._stop_event.is_set():
-            try:
-                url = f"http://{self.leader_addr}/replication/wal?start_lsn={self._last_applied_lsn}"
-                status, data, _text = _http_get_json(url, timeout=2.0)
-                if status == 200 and isinstance(data, dict):
-                    self.set_known_leader_lsn(int(data.get("leader_lsn", 0) or 0))
-                    changes = data.get("changes", [])
-                    if isinstance(changes, list) and changes:
-                        self.apply_changes(changes)
-                elif status == 410:
-                    self._initial_full_sync()
-            except Exception as e:
-                logging.debug("Follower catch-up error: %s", e)
-            
+            with tracing.start_span(
+                "replication.follower.pull_wal",
+                attributes={
+                    "pxkv.replication.leader": self.leader_addr,
+                    "pxkv.replication.start_lsn": int(self._last_applied_lsn),
+                },
+                kind="client",
+            ) as pspan:
+                try:
+                    url = f"http://{self.leader_addr}/replication/wal?start_lsn={self._last_applied_lsn}"
+                    status, data, _text = _http_get_json(url, timeout=2.0)
+                    tracing.set_attribute(pspan, "http.status_code", status)
+                    if status == 200 and isinstance(data, dict):
+                        self.set_known_leader_lsn(int(data.get("leader_lsn", 0) or 0))
+                        changes = data.get("changes", [])
+                        if isinstance(changes, list) and changes:
+                            tracing.set_attribute(pspan, "pxkv.replication.batch_size", len(changes))
+                            self.apply_changes(changes)
+                    elif status == 410:
+                        tracing.set_attribute(pspan, "pxkv.replication.wal_truncated", True)
+                        self._initial_full_sync()
+                except Exception as e:
+                    tracing.set_status_error(pspan, str(e))
+                    logging.debug("Follower catch-up error: %s", e)
+
             time.sleep(settings.REPLICATION_SYNC_INTERVAL)
 
     def apply_changes(self, changes: List[Dict[str, Any]]):
         if self.role != "follower":
             return
-            
+
+        with tracing.start_span(
+            "replication.follower.apply_changes",
+            attributes={
+                "pxkv.replication.batch_size": len(changes),
+                "pxkv.replication.last_applied_lsn": int(self._last_applied_lsn),
+            },
+            kind="consumer",
+        ):
+            self._apply_changes_impl(changes)
+
+    def _apply_changes_impl(self, changes: List[Dict[str, Any]]) -> None:
         changes.sort(key=lambda x: x.get("lsn", 0))
         
         last_applied = False

@@ -32,6 +32,7 @@ from ..config.settings import settings
 from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 from ..notifications import notifier
+from .. import tracing
 
 def _server_ssl_context(cert_file: str, key_file: str) -> Optional[ssl.SSLContext]:
     if not cert_file or not key_file:
@@ -297,6 +298,11 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
         self._ensure_request_context()
+        span = getattr(self, "_span", None)
+        if span is not None:
+            tracing.set_attribute(span, "http.status_code", int(code))
+            if int(code) >= 400:
+                tracing.set_status_error(span, f"HTTP {int(code)}")
         if not isinstance(body, (bytes, bytearray)):
             body = str(body).encode("utf-8")
         self.send_response(code)
@@ -449,20 +455,31 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         return headers
 
     def _http_get_bytes(self, url: str, headers: Dict[str, str], timeout: float) -> tuple[int, bytes, Dict[str, str]]:
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                status = int(getattr(resp, "status", 0) or 0)
-                body = resp.read()
-                return status, body, dict(resp.headers.items())
-        except urllib.error.HTTPError as e:
+        tracing.inject_headers(headers)
+        with tracing.start_span(
+            "http get follower-proxy",
+            attributes={"http.method": "GET", "http.url": url},
+            kind="client",
+        ) as span:
+            req = urllib.request.Request(url, headers=headers, method="GET")
             try:
-                body = e.read()
-            except Exception:
-                body = b""
-            return int(getattr(e, "code", 500)), body, dict(getattr(e, "headers", {}) or {})
-        except Exception:
-            return 0, b"", {}
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = int(getattr(resp, "status", 0) or 0)
+                    body = resp.read()
+                    tracing.set_attribute(span, "http.status_code", status)
+                    return status, body, dict(resp.headers.items())
+            except urllib.error.HTTPError as e:
+                try:
+                    body = e.read()
+                except Exception:
+                    body = b""
+                code = int(getattr(e, "code", 500))
+                tracing.set_attribute(span, "http.status_code", code)
+                tracing.set_status_error(span, f"HTTP {code}")
+                return code, body, dict(getattr(e, "headers", {}) or {})
+            except Exception as e:
+                tracing.set_status_error(span, str(e))
+                return 0, b"", {}
 
     def _staleness_ok(self, hdrs: Dict[str, str], max_lag_lsn: int, max_age_ms: float) -> bool:
         lag = self._parse_int(hdrs.get("X-PXKV-Replication-Lag-LSN", "0"), 0)
@@ -599,8 +616,26 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             writer.wfile.write(b"0\r\n\r\n")
             writer.flush()
 
+    def _request_span(self, method: str):
+        return tracing.start_span(
+            f"http {method.lower()}",
+            attributes={
+                "http.method": method,
+                "http.target": self.path,
+                "http.scheme": "http",
+                "net.peer.ip": self._client_ip(),
+                "pxkv.request_id": getattr(self, "_request_id", ""),
+            },
+            kind="server",
+        )
+
     def _inc_metrics(self, method: str, route: str = "", error: bool = False) -> None:
         registry.inc_requests(method, error)
+        span = getattr(self, "_span", None)
+        if span is not None and route:
+            tracing.set_attribute(span, "http.route", route)
+            if error:
+                tracing.set_attribute(span, "pxkv.error", True)
         if route:
             self._ensure_request_context()
             elapsed_ms = (time.time() - self._request_started_at) * 1000.0
@@ -610,6 +645,11 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()
         self._fault_sleep()
+        with tracing.extract_context(self.headers), self._request_span("GET") as span:
+            self._span = span
+            self._do_GET_inner()
+
+    def _do_GET_inner(self) -> None:
         try:
             parts, query = self._parse()
             if not parts:
@@ -809,6 +849,11 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()
         self._fault_sleep()
+        with tracing.extract_context(self.headers), self._request_span("PUT") as span:
+            self._span = span
+            self._do_PUT_inner()
+
+    def _do_PUT_inner(self) -> None:
         try:
             if not self._rate_limit("PUT /kv/:key"):
                 return
@@ -847,6 +892,11 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()
         self._fault_sleep()
+        with tracing.extract_context(self.headers), self._request_span("DELETE") as span:
+            self._span = span
+            self._do_DELETE_inner()
+
+    def _do_DELETE_inner(self) -> None:
         try:
             if not self._rate_limit("DELETE /kv/:key"):
                 return
@@ -872,6 +922,11 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()
         self._fault_sleep()
+        with tracing.extract_context(self.headers), self._request_span("POST") as span:
+            self._span = span
+            self._do_POST_inner()
+
+    def _do_POST_inner(self) -> None:
         try:
             parts, _ = self._parse()
             
@@ -1119,6 +1174,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
 
 def run() -> None:
+    tracing.init_tracing()
     STORE._replication.start()
 
     httpd = BaseHTTPServer.ThreadingHTTPServer((settings.HOST, settings.PORT), KVHandler)
