@@ -223,6 +223,21 @@ class ShardedKeyValueStore(object):
             all_keys.extend(shard.keys())
         return all_keys
 
+    def get_ttl(self, key: Any) -> Optional[float]:
+        return self._bucket(key).get_ttl(key)
+
+    def persist(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> bool:
+        with self._write_lock:
+            had_ttl = self._bucket(key).persist(key)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("persist", key)
+            if not skip_replication:
+                self._replication.enqueue_change("persist", key, lsn=lsn)
+            shard = self._idx(key)
+            notifier.publish("persist", key, lsn=lsn, shard=shard)
+            return had_ttl
+
     def scan(
         self,
         prefix: Optional[str] = None,

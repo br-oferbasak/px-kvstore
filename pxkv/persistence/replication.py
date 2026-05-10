@@ -377,7 +377,12 @@ class ReplicationManager:
                     self.store.mset(key, ttl, skip_replication=True)
                 elif op == "incr":
                     self.store.incr(key, val, ttl, skip_replication=True)
-                
+                elif op == "persist":
+                    try:
+                        self.store.persist(key, skip_replication=True)
+                    except KeyError:
+                        pass
+
                 self._last_applied_lsn = lsn
                 last_applied = True
             except Exception as e:

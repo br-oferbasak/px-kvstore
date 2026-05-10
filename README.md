@@ -100,7 +100,7 @@ You can connect to PX-KVStore using any standard Redis client:
 redis-cli -p 6379 SET mykey "Hello Redis"
 redis-cli -p 6379 GET mykey
 ```
-Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`.
+Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`.
 
 ---
 
@@ -127,7 +127,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Rate Limiting**: Per-route token bucket limits with admin-configurable policies.
 - [x] **TLS / HTTPS**: Optional TLS listener for HTTP and Redis endpoints.
 - [x] **Request Tracing**: Add OpenTelemetry trace spans for API and replication paths.
-- [ ] **Redis TTL Parity**: Support TTL/PTTL/PERSIST for better Redis compatibility.
+- [x] **Redis TTL Parity**: Support TTL/PTTL/PERSIST for better Redis compatibility.
 - [ ] **SCAN Cursor**: True cursor-based scan for large keyspaces without `start_after` hacks.
 - [ ] **ETag / Conditional GET**: Return ETag for GET /kv and honor If-None-Match to save bandwidth.
 - [ ] **Read Repair / Anti-Entropy**: Background verification and repair for follower divergence.

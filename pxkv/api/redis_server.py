@@ -225,9 +225,9 @@ class RedisServer(threading.Thread):
         )
 
     def _required_role_for_cmd(self, cmd: str) -> str:
-        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "SUBSCRIBE", "UNSUBSCRIBE"):
+        if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE"):
             return ROLE_READER
-        if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "FLUSHALL"):
+        if cmd in ("SET", "DEL", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST", "FLUSHALL"):
             return ROLE_WRITER
         if cmd == "AUTH":
             return ROLE_READER
@@ -247,6 +247,7 @@ class RedisServer(threading.Thread):
                 "DECR",
                 "DECRBY",
                 "EXPIRE",
+                "PERSIST",
                 "FLUSHALL",
             ):
                 return encode_error("READONLY You can't write against a read-only follower."), role
@@ -364,6 +365,30 @@ class RedisServer(threading.Thread):
                     return encode_integer(1), role
                 except KeyError:
                     return encode_integer(0), role
+
+            elif cmd in ("TTL", "PTTL"):
+                if len(args) != 2:
+                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role
+                key = args[1].decode("utf-8")
+                try:
+                    remaining = self.store.get_ttl(key)
+                except KeyError:
+                    return encode_integer(-2), role
+                if remaining is None:
+                    return encode_integer(-1), role
+                if cmd == "TTL":
+                    return encode_integer(int(remaining)), role
+                return encode_integer(int(remaining * 1000.0)), role
+
+            elif cmd == "PERSIST":
+                if len(args) != 2:
+                    return encode_error("ERR wrong number of arguments for 'PERSIST' command"), role
+                key = args[1].decode("utf-8")
+                try:
+                    cleared = self.store.persist(key)
+                except KeyError:
+                    return encode_integer(0), role
+                return encode_integer(1 if cleared else 0), role
 
             elif cmd == "INFO":
                 uptime = int(time.time() - registry.get_all()["started_at"])

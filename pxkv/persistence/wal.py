@@ -207,6 +207,11 @@ def recover_from_wal(store, wal: WAL):
                         store.mset(key, ttl, skip_wal=True, skip_replication=True)
                     elif op == "incr":
                         store.incr(key, val, ttl, skip_wal=True, skip_replication=True)
+                    elif op == "persist":
+                        try:
+                            store.persist(key, skip_wal=True, skip_replication=True)
+                        except KeyError:
+                            pass
                 except Exception as e:
                     logging.warning("Failed to recover entry: %s", e)
         wal._lsn = max_lsn

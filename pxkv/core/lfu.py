@@ -244,6 +244,29 @@ class LFUKeyValueStore(object):
             self._purge_expired()
             return list(self._map.keys())
 
+    def get_ttl(self, key: Any) -> Optional[float]:
+        """Remaining TTL in seconds. Raises KeyError if key is absent;
+        returns None if key has no TTL set; otherwise float seconds (>= 0)."""
+        with self._lock:
+            self._purge_expired()
+            if key not in self._map:
+                raise KeyError(key)
+            ts = self._ttl.get(key)
+            if ts is None:
+                return None
+            return max(0.0, ts - time.time())
+
+    def persist(self, key: Any) -> bool:
+        """Clear the TTL on a key. Raises KeyError if absent.
+        Returns True if a TTL was cleared, False if the key had none."""
+        with self._lock:
+            self._purge_expired()
+            if key not in self._map:
+                raise KeyError(key)
+            had_ttl = self._ttl.get(key) is not None
+            self._ttl[key] = None
+            return had_ttl
+
     def iter_string_keys_sorted(
         self, *, prefix: Optional[str] = None, start_after: Optional[str] = None
     ) -> Iterator[str]:
