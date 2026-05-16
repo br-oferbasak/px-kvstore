@@ -4,6 +4,8 @@
 import binascii
 import heapq
 import bisect
+import json
+import base64
 from collections import defaultdict
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -269,6 +271,92 @@ class ShardedKeyValueStore(object):
                 continue
             heapq.heappush(heap, (nxt, i))
         return out
+
+    def _encode_cursor(self, state: Dict[str, Any]) -> str:
+        """Encode cursor state as a base64-encoded JSON string."""
+        return base64.urlsafe_b64encode(json.dumps(state, ensure_ascii=False).encode("utf-8")).decode("ascii")
+
+    def _decode_cursor(self, cursor: Optional[str]) -> Dict[str, Any]:
+        """Decode cursor from base64-encoded JSON; empty/default state for None/empty."""
+        if not cursor:
+            return {
+                "shard_positions": [None] * len(self._shards),
+                "done": False,
+            }
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+            if "shard_positions" not in decoded:
+                decoded["shard_positions"] = [None] * len(self._shards)
+            if len(decoded["shard_positions"]) != len(self._shards):
+                decoded["shard_positions"] = [None] * len(self._shards)
+            return decoded
+        except Exception:
+            return {
+                "shard_positions": [None] * len(self._shards),
+                "done": False,
+            }
+
+    def scan_with_cursor(
+        self,
+        cursor: Optional[str] = None,
+        prefix: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[str, List[str]]:
+        """
+        True cursor-based scan.
+        Returns (next_cursor, keys). When next_cursor is "0", scan is complete.
+        """
+        state = self._decode_cursor(cursor)
+        if state.get("done", False):
+            return "0", []
+
+        lim = max(0, int(limit))
+        if lim == 0:
+            return cursor or "0", []
+
+        out: List[str] = []
+        shard_positions = list(state["shard_positions"])
+
+        iters: List[Tuple[int, Iterator[str]]] = []
+        heap: List[Tuple[str, int, int]] = []  # (key, shard_idx, iter_idx)
+
+        iter_idx = 0
+        for shard_idx in range(len(self._shards)):
+            start_after = shard_positions[shard_idx]
+            it = self._shards[shard_idx].iter_string_keys_sorted(prefix=prefix, start_after=start_after)
+            iters.append((shard_idx, it))
+            try:
+                first = next(it)
+                heapq.heappush(heap, (first, shard_idx, iter_idx))
+            except StopIteration:
+                pass
+            iter_idx += 1
+
+        while heap and len(out) < lim:
+            k, shard_idx, _ = heapq.heappop(heap)
+            out.append(k)
+            # Update the shard's position to this key (start_after is exclusive)
+            shard_positions[shard_idx] = k
+            # Try to get next key from this shard's iterator
+            shard_idx_in_iters, it = None, None
+            for idx, (s_idx, i) in enumerate(iters):
+                if s_idx == shard_idx:
+                    shard_idx_in_iters, it = idx, i
+                    break
+            if it is not None:
+                try:
+                    nxt = next(it)
+                    heapq.heappush(heap, (nxt, shard_idx, shard_idx_in_iters))
+                except StopIteration:
+                    pass
+
+        done = not heap
+        new_state = {
+            "shard_positions": shard_positions,
+            "done": done,
+        }
+        next_cursor = "0" if done else self._encode_cursor(new_state)
+        return next_cursor, out
 
     def dump(self) -> Dict[str, Dict[str, Any]]:
         with self._write_lock:

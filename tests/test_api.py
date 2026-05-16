@@ -4,6 +4,7 @@ import time
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 import gzip
 import threading
 import ssl
@@ -268,5 +269,59 @@ def test_tls_https_and_rediss(tmp_path):
             except Exception:
                 pass
         assert b"+PONG" in data
+    finally:
+        stop_proc(proc)
+
+
+def test_scan_cursor():
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        # Insert some keys
+        test_keys = [f"key_{i:03d}" for i in range(25)]
+        for k in test_keys:
+            req = urllib.request.Request(
+                f"{base}/kv/{k}",
+                data=json.dumps({"value": f"v_{k}"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PUT",
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                assert resp.status in (201, 204)
+
+        # Scan with small limit and collect all keys via cursor
+        collected = []
+        cursor = None
+        while True:
+            url = f"{base}/kv/scan-cursor?limit=5"
+            if cursor:
+                url += f"&cursor={urllib.parse.quote_plus(cursor)}"
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                assert resp.status == 200
+                body = json.loads(resp.read().decode("utf-8"))
+            collected.extend(body["keys"])
+            cursor = body["cursor"]
+            if cursor == "0":
+                break
+
+        # Verify we got all keys, sorted
+        assert sorted(collected) == sorted(test_keys)
+
     finally:
         stop_proc(proc)

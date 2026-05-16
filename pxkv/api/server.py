@@ -813,6 +813,31 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("GET", route="GET /kv/scan")
                 return
 
+            if len(parts) >= 2 and parts[1] == "scan-cursor":
+                prefix = None
+                cursor = None
+                limit = 100
+                if "prefix" in query:
+                    prefix = query["prefix"][0]
+                if "cursor" in query:
+                    cursor = query["cursor"][0]
+                if "limit" in query:
+                    try:
+                        limit = int(query["limit"][0])
+                    except ValueError:
+                        self._send(400, "limit must be int")
+                        self._inc_metrics("GET", route="GET /kv/scan-cursor", error=True)
+                        return
+                next_cursor, keys = STORE.scan_with_cursor(cursor=cursor, prefix=prefix, limit=limit)
+                extra = getattr(self, "_fallback_headers", None)
+                headers = self._staleness_headers()
+                if isinstance(extra, dict):
+                    headers = {**headers, **extra}
+                    self._fallback_headers = None
+                self._json(200, {"cursor": next_cursor, "keys": keys}, headers=headers)
+                self._inc_metrics("GET", route="GET /kv/scan-cursor")
+                return
+
             if len(parts) < 2:
                 raise ValueError
 
