@@ -160,6 +160,9 @@ class ShardedKeyValueStore(object):
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
 
+    def read_with_etag(self, key: Any) -> Tuple[Any, str]:
+        return self._bucket(key).read_with_etag(key)
+
     def update(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
             self._bucket(key).update(key, value, ttl)

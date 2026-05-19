@@ -325,3 +325,79 @@ def test_scan_cursor():
 
     finally:
         stop_proc(proc)
+
+
+def test_etag_conditional_get():
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        # Create a key
+        test_key = "etag_test"
+        test_value = {"data": "etag_value"}
+        req = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            data=json.dumps(test_value).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            assert resp.status in (201, 204)
+
+        # First GET should return 200 and ETag
+        with urllib.request.urlopen(f"{base}/kv/{test_key}", timeout=2.0) as resp:
+            assert resp.status == 200
+            etag = resp.headers.get("ETag")
+            assert etag is not None and etag != ""
+            body = json.loads(resp.read().decode("utf-8"))
+            assert body["key"] == test_key
+            assert body["value"] == test_value
+
+        # Conditional GET with If-None-Match should return 304
+        req_304 = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            headers={"If-None-Match": etag},
+        )
+        try:
+            with urllib.request.urlopen(req_304, timeout=2.0):
+                raise AssertionError("Expected 304 Not Modified")
+        except urllib.error.HTTPError as e:
+            assert e.code == 304
+            assert e.headers.get("ETag") == etag
+
+        # Update the key
+        updated_value = {"data": "updated_etag_value"}
+        req_update = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            data=json.dumps(updated_value).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_update, timeout=2.0) as resp:
+            assert resp.status in (201, 204)
+
+        # Conditional GET with old ETag should now return 200
+        with urllib.request.urlopen(req_304, timeout=2.0) as resp:
+            assert resp.status == 200
+            new_etag = resp.headers.get("ETag")
+            assert new_etag != etag
+            body = json.loads(resp.read().decode("utf-8"))
+            assert body["value"] == updated_value
+
+    finally:
+        stop_proc(proc)

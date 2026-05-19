@@ -842,12 +842,26 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 raise ValueError
 
             key = parts[1]
-            value = STORE.read(key)
+            value, etag = STORE.read_with_etag(key)
+            
+            if_none_match = self.headers.get("If-None-Match", "")
+            if if_none_match == etag or (if_none_match == "*"):
+                extra = getattr(self, "_fallback_headers", None)
+                headers = self._staleness_headers()
+                if isinstance(extra, dict):
+                    headers = {**headers, **extra}
+                    self._fallback_headers = None
+                headers["ETag"] = etag
+                self._send(304, headers=headers)
+                self._inc_metrics("GET", route="GET /kv/:key (not_modified)")
+                return
+
             extra = getattr(self, "_fallback_headers", None)
             headers = self._staleness_headers()
             if isinstance(extra, dict):
                 headers = {**headers, **extra}
                 self._fallback_headers = None
+            headers["ETag"] = etag
             self._json(200, {"key": key, "value": value}, headers=headers)
             self._inc_metrics("GET", route="GET /kv/:key")
         except KeyError as e:

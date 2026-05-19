@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import time
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+import hashlib
+import json
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from threading import Lock
 from .base import _SortedStringKeyIndex
 from ..tiering.base import TieringBackend
@@ -100,6 +102,19 @@ class LFUKeyValueStore(object):
             self._touch(key)
             self._evict_if_needed()
 
+    def _compute_etag(self, value: Any, ttl: Optional[float]) -> str:
+        """Compute an ETag from the value and TTL timestamp."""
+        def _default(obj):
+            if isinstance(obj, (bytes, bytearray)):
+                return obj.decode("utf-8", errors="replace")
+            raise TypeError
+        try:
+            payload = json.dumps({"value": value, "ttl": ttl}, default=_default, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        except TypeError:
+            payload = json.dumps({"value": str(value), "ttl": ttl}, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        h = hashlib.sha256(payload).hexdigest()
+        return f'"{h}"'
+
     def read(self, key: Any) -> Any:
         with self._lock:
             self._purge_expired()
@@ -126,6 +141,36 @@ class LFUKeyValueStore(object):
                 self._evict_if_needed()
             self._touch(key)
             return self._map[key]
+
+    def read_with_etag(self, key: Any) -> Tuple[Any, str]:
+        with self._lock:
+            self._purge_expired()
+            if key not in self._map:
+                if self._tiering is None:
+                    raise KeyError(key)
+                try:
+                    hit = self._tiering.get(key)
+                except Exception:
+                    hit = None
+                if hit is None:
+                    raise KeyError(key)
+                self._map[key] = hit.value
+                self._skeys.add(key)
+                if hit.ttl_remaining is None:
+                    self._ttl[key] = None
+                else:
+                    self._ttl[key] = time.time() + float(hit.ttl_remaining)
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
+                self._touch(key)
+                self._evict_if_needed()
+            self._touch(key)
+            value = self._map[key]
+            ttl = self._ttl.get(key)
+            etag = self._compute_etag(value, ttl)
+            return value, etag
 
     def update(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         with self._lock:

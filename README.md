@@ -128,7 +128,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **TLS / HTTPS**: Optional TLS listener for HTTP and Redis endpoints.
 - [x] **Request Tracing**: Add OpenTelemetry trace spans for API and replication paths.
 - [x] **Redis TTL Parity**: Support TTL/PTTL/PERSIST for better Redis compatibility.
-- [ ] **SCAN Cursor**: True cursor-based scan for large keyspaces without `start_after` hacks.
+- [x] **SCAN Cursor**: True cursor-based scan for large keyspaces without `start_after` hacks.
 - [ ] **ETag / Conditional GET**: Return ETag for GET /kv and honor If-None-Match to save bandwidth.
 - [ ] **Read Repair / Anti-Entropy**: Background verification and repair for follower divergence.
 
