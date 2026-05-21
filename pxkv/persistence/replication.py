@@ -93,6 +93,56 @@ class ReplicationManager:
         else:
             logging.info("Starting replication as FOLLOWER. Leader: %s", self.leader_addr)
             threading.Thread(target=self._follower_replication_loop, daemon=True).start()
+            if getattr(settings, "ANTI_ENTROPY_ENABLED", True):
+                threading.Thread(target=self._anti_entropy_loop, daemon=True).start()
+
+    def _anti_entropy_loop(self):
+        interval = float(getattr(settings, "ANTI_ENTROPY_INTERVAL", 60.0))
+        max_lag_lsn = int(getattr(settings, "ANTI_ENTROPY_MAX_LAG_LSN", 100000))
+        max_age_ms = float(getattr(settings, "ANTI_ENTROPY_MAX_AGE_MS", 300000.0))
+        logging.info(
+            "Anti-entropy (read repair / divergence repair) enabled (interval=%.1fs, max_lag=%d, max_age=%.1fms)",
+            interval, max_lag_lsn, max_age_ms
+        )
+        while not self._stop_event.is_set():
+            time.sleep(interval)
+            if self._stop_event.is_set():
+                break
+            try:
+                with tracing.start_span(
+                    "replication.follower.anti_entropy",
+                    attributes={
+                        "pxkv.replication.leader": self.leader_addr,
+                    },
+                    kind="client",
+                ) as ae_span:
+                    # Check if we need full sync repair
+                    need_repair = False
+                    reason = ""
+
+                    now = time.time()
+                    lag_lsn = max(0, int(self._known_leader_lsn) - int(self._last_applied_lsn))
+                    age_ms = 0.0
+                    if self._last_applied_at > 0:
+                        age_ms = max(0.0, (now - float(self._last_applied_at)) * 1000.0)
+
+                    if lag_lsn > max_lag_lsn:
+                        need_repair = True
+                        reason = f"lag_lsn={lag_lsn} > max_lag={max_lag_lsn}"
+                    elif age_ms > max_age_ms:
+                        need_repair = True
+                        reason = f"last_applied_age_ms={age_ms:.0f} > max_age={max_age_ms:.0f}"
+
+                    tracing.set_attribute(ae_span, "pxkv.anti_entropy.lag_lsn", lag_lsn)
+                    tracing.set_attribute(ae_span, "pxkv.anti_entropy.last_applied_age_ms", age_ms)
+                    tracing.set_attribute(ae_span, "pxkv.anti_entropy.need_repair", need_repair)
+                    if need_repair:
+                        tracing.set_attribute(ae_span, "pxkv.anti_entropy.reason", reason)
+                        logging.info("Anti-entropy triggering full sync repair: %s", reason)
+                        self._initial_full_sync()
+                        logging.info("Anti-entropy full sync repair completed. last_applied_lsn=%d", self._last_applied_lsn)
+            except Exception as e:
+                logging.error("Anti-entropy error: %s", e)
 
     def _initial_full_sync(self):
         logging.info("Performing initial full sync from leader: %s", self.leader_addr)

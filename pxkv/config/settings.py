@@ -96,6 +96,11 @@ class Settings:
             self.REPLICATION_QUEUE_MAX = int(os.getenv("PXKV_REPLICATION_QUEUE_MAX", "10000") or "10000")
             self.REPLICATION_SHED_POLICY = os.getenv("PXKV_REPLICATION_SHED_POLICY", "drop_newest").lower()
 
+            self.ANTI_ENTROPY_ENABLED = os.getenv("PXKV_ANTI_ENTROPY_ENABLED", "true").lower() == "true"
+            self.ANTI_ENTROPY_INTERVAL = float(os.getenv("PXKV_ANTI_ENTROPY_INTERVAL", "60.0") or "60.0")
+            self.ANTI_ENTROPY_MAX_LAG_LSN = int(os.getenv("PXKV_ANTI_ENTROPY_MAX_LAG_LSN", "100000") or "100000")
+            self.ANTI_ENTROPY_MAX_AGE_MS = float(os.getenv("PXKV_ANTI_ENTROPY_MAX_AGE_MS", "300000.0") or "300000.0")
+
             if self.CONFIG_FILE:
                 try:
                     if os.path.exists(self.CONFIG_FILE):

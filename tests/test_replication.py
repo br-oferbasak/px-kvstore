@@ -256,3 +256,47 @@ def test_follower_http_readonly_rejects_writes(leader_follower_cluster):
     wait_for_kv(follower_base, "ro_seed", "v1", timeout_s=8.0)
     status = http_put(f"http://localhost:{follower_port}/kv/should_fail", b"nope")
     assert status == 403
+
+
+def test_replication_anti_entropy_config():
+    leader_port = get_free_port()
+    follower_port = get_free_port()
+
+    leader_env = os.environ.copy()
+    leader_env["PXKV_PORT"] = leader_port
+    leader_env["PXKV_REPLICATION_ROLE"] = "leader"
+    leader_env["PXKV_REDIS_ENABLED"] = "false"
+
+    leader_proc = subprocess.Popen(["python3", "server.py"], env=leader_env)
+    leader_base = f"http://localhost:{leader_port}"
+    wait_for_http_ready(leader_base, timeout_s=8.0)
+
+    # Insert test keys
+    for i in range(3):
+        assert http_put(f"{leader_base}/kv/ae_key_{i}", f"ae_val_{i}".encode("utf-8")) in [201, 204]
+
+    # Start follower with anti-entropy enabled and short interval
+    follower_env = os.environ.copy()
+    follower_env["PXKV_PORT"] = follower_port
+    follower_env["PXKV_REPLICATION_ROLE"] = "follower"
+    follower_env["PXKV_REPLICATION_LEADER_ADDR"] = f"localhost:{leader_port}"
+    follower_env["PXKV_REDIS_ENABLED"] = "false"
+    follower_env["PXKV_ANTI_ENTROPY_ENABLED"] = "true"
+    follower_env["PXKV_ANTI_ENTROPY_INTERVAL"] = "1.0"
+    follower_env["PXKV_ANTI_ENTROPY_MAX_LAG_LSN"] = "100"
+    follower_env["PXKV_ANTI_ENTROPY_MAX_AGE_MS"] = "10000.0"
+
+    follower_proc = subprocess.Popen(["python3", "server.py"], env=follower_env)
+    follower_base = f"http://localhost:{follower_port}"
+    wait_for_http_ready(follower_base, timeout_s=8.0)
+
+    # Wait for normal full sync
+    for i in range(3):
+        wait_for_kv(follower_base, f"ae_key_{i}", f"ae_val_{i}", timeout_s=8.0)
+
+    # Verify anti-entropy config is present (no crash)
+    status, metrics = http_get_json(f"{follower_base}/admin/metrics")
+    assert status == 200
+
+    stop_proc(leader_proc)
+    stop_proc(follower_proc)
