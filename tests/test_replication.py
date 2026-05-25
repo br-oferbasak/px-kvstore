@@ -300,3 +300,54 @@ def test_replication_anti_entropy_config():
 
     stop_proc(leader_proc)
     stop_proc(follower_proc)
+
+
+def test_cross_cluster_conflict_resolution_last_write_wins():
+    from pxkv.core.sharded import ShardedKeyValueStore
+
+    # Create two stores with different cluster IDs
+    store1 = ShardedKeyValueStore(shards=2, wal_path="", tiering_dir="")
+    store2 = ShardedKeyValueStore(shards=2, wal_path="", tiering_dir="")
+
+    # Write from store1 first
+    ts_early = time.time() - 10.0
+    store1.create("k1", "v1", origin_cluster_id="cluster-a", origin_ts=ts_early)
+
+    # Write from store2 later (should win)
+    ts_late = time.time()
+    store2.create("k1", "v2", origin_cluster_id="cluster-b", origin_ts=ts_late)
+
+    # Resolve conflict in store1
+    should_apply, resolved_val, _ = store1.resolve_conflict(
+        "k1", "v2", None,
+        new_origin_cluster_id="cluster-b",
+        new_origin_ts=ts_late,
+    )
+    assert should_apply is True
+
+    # Now apply it
+    store1.update("k1", "v2", origin_cluster_id="cluster-b", origin_ts=ts_late)
+    assert store1.read("k1") == "v2"
+    meta = store1.get_xmeta("k1")
+    assert meta is not None
+    assert meta["origin_cluster_id"] == "cluster-b"
+    assert meta["origin_ts"] == ts_late
+
+    # Test tie: same ts, use cluster ID lex order (cluster-b wins over cluster-a)
+    ts_same = time.time()
+    store1.create("k2", "va", origin_cluster_id="cluster-a", origin_ts=ts_same)
+    should_apply2, _, _ = store1.resolve_conflict(
+        "k2", "vb", None,
+        new_origin_cluster_id="cluster-b",
+        new_origin_ts=ts_same,
+    )
+    assert should_apply2 is True
+
+    # Test older write: should not apply
+    store1.create("k3", "v_newer", origin_cluster_id="cluster-c", origin_ts=time.time())
+    should_apply3, _, _ = store1.resolve_conflict(
+        "k3", "v_older", None,
+        new_origin_cluster_id="cluster-d",
+        new_origin_ts=time.time() - 100,
+    )
+    assert should_apply3 is False

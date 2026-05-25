@@ -6,6 +6,7 @@ import heapq
 import bisect
 import json
 import base64
+import time
 from collections import defaultdict
 import threading
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -14,6 +15,7 @@ from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
+from ..config.settings import settings
 from ..tiering.base import TieringBackend
 from ..tiering.file import FileTieringBackend
 from ..notifications import notifier
@@ -146,33 +148,153 @@ class ShardedKeyValueStore(object):
                 for k in keys:
                     notifier.publish("expire", k, lsn=int(getattr(self._wal, "_lsn", 0) or 0), shard=idx)
 
-    def create(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
+    def get_xmeta(self, key: Any) -> Optional[Dict[str, Any]]:
+        """Get cross-cluster metadata for a key (origin_cluster_id, origin_ts)."""
+        return self._bucket(key).get_xmeta(key)
+
+    def set_xmeta(self, key: Any, meta: Dict[str, Any]) -> None:
+        """Set cross-cluster metadata for a key."""
+        self._bucket(key).set_xmeta(key, meta)
+
+    def resolve_conflict(
+        self,
+        key: Any,
+        new_value: Any,
+        new_ttl: Optional[float],
+        new_origin_cluster_id: Optional[str] = None,
+        new_origin_ts: Optional[float] = None,
+        policy: Optional[str] = None,
+    ) -> Tuple[bool, Any, Optional[float]]:
+        """Resolve cross-cluster conflict for a key."""
+        if policy is None:
+            policy = getattr(settings, "CROSS_CLUSTER_CONFLICT_POLICY", "last_write_wins")
+        return self._bucket(key).resolve_conflict(
+            key, new_value, new_ttl, new_origin_cluster_id, new_origin_ts, policy
+        )
+
+    def create(
+        self,
+        key: Any,
+        value: Any,
+        ttl: Optional[float] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> None:
         with self._write_lock:
             self._bucket(key).create(key, value, ttl)
+            meta = {
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
+            }
+            self._bucket(key).set_xmeta(key, meta)
             lsn = 0
             if not skip_wal:
                 lsn = self._wal.log("create", key, value, ttl)
             if not skip_replication:
-                self._replication.enqueue_change("create", key, value, ttl, lsn=lsn)
+                self._replication.enqueue_change(
+                    "create", key, value, ttl, lsn=lsn,
+                    origin_cluster_id=meta["origin_cluster_id"], origin_ts=meta["origin_ts"],
+                )
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
+
+    def update(
+        self,
+        key: Any,
+        value: Any,
+        ttl: Optional[float] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> None:
+        with self._write_lock:
+            self._bucket(key).update(key, value, ttl)
+            meta = {
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
+            }
+            self._bucket(key).set_xmeta(key, meta)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("update", key, value, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change(
+                    "update", key, value, ttl, lsn=lsn,
+                    origin_cluster_id=meta["origin_cluster_id"], origin_ts=meta["origin_ts"],
+                )
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
+
+    def mset(
+        self,
+        items: Dict[Any, Any],
+        ttl: Optional[float] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> None:
+        with self._write_lock:
+            grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
+            for k, v in items.items():
+                grouped[self._idx(k)][k] = v
+            for idx, sub in grouped.items():
+                self._shards[idx].mset(sub, ttl)
+            meta = {
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
+            }
+            for k in items.keys():
+                self._bucket(k).set_xmeta(k, meta)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("mset", items, ttl=ttl)
+            if not skip_replication:
+                self._replication.enqueue_change(
+                    "mset", items, ttl=ttl, lsn=lsn,
+                    origin_cluster_id=meta["origin_cluster_id"], origin_ts=meta["origin_ts"],
+                )
+            for k in items.keys():
+                shard = self._idx(k)
+                notifier.publish("set", k, lsn=lsn, shard=shard)
+
+    def incr(
+        self,
+        key: Any,
+        delta: float = 1,
+        ttl: Optional[float] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> float:
+        with self._write_lock:
+            val = self._bucket(key).incr(key, delta, ttl)
+            meta = {
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
+            }
+            self._bucket(key).set_xmeta(key, meta)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("incr", key, delta, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change(
+                    "incr", key, delta, ttl, lsn=lsn,
+                    origin_cluster_id=meta["origin_cluster_id"], origin_ts=meta["origin_ts"],
+                )
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
+            return val
 
     def read(self, key: Any) -> Any:
         return self._bucket(key).read(key)
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
         return self._bucket(key).read_with_etag(key)
-
-    def update(self, key: Any, value: Any, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        with self._write_lock:
-            self._bucket(key).update(key, value, ttl)
-            lsn = 0
-            if not skip_wal:
-                lsn = self._wal.log("update", key, value, ttl)
-            if not skip_replication:
-                self._replication.enqueue_change("update", key, value, ttl, lsn=lsn)
-            shard = self._idx(key)
-            notifier.publish("set", key, lsn=lsn, shard=shard)
 
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
@@ -185,22 +307,6 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("del", key, lsn=lsn, shard=shard)
 
-    def mset(self, items: Dict[Any, Any], ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> None:
-        with self._write_lock:
-            grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
-            for k, v in items.items():
-                grouped[self._idx(k)][k] = v
-            for idx, sub in grouped.items():
-                self._shards[idx].mset(sub, ttl)
-            lsn = 0
-            if not skip_wal:
-                lsn = self._wal.log("mset", items, ttl=ttl)
-            if not skip_replication:
-                self._replication.enqueue_change("mset", items, ttl=ttl, lsn=lsn)
-            for k in items.keys():
-                shard = self._idx(k)
-                notifier.publish("set", k, lsn=lsn, shard=shard)
-
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
         for k in keys:
@@ -209,18 +315,6 @@ class ShardedKeyValueStore(object):
         for idx, sub in grouped.items():
             out.update(self._shards[idx].mget(sub))
         return out
-
-    def incr(self, key: Any, delta: float = 1, ttl: Optional[float] = None, skip_wal: bool = False, skip_replication: bool = False) -> float:
-        with self._write_lock:
-            val = self._bucket(key).incr(key, delta, ttl)
-            lsn = 0
-            if not skip_wal:
-                lsn = self._wal.log("incr", key, delta, ttl)
-            if not skip_replication:
-                self._replication.enqueue_change("incr", key, delta, ttl, lsn=lsn)
-            shard = self._idx(key)
-            notifier.publish("set", key, lsn=lsn, shard=shard)
-            return val
 
     def keys(self) -> List[Any]:
         all_keys: List[Any] = []

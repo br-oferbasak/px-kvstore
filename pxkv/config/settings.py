@@ -101,6 +101,11 @@ class Settings:
             self.ANTI_ENTROPY_MAX_LAG_LSN = int(os.getenv("PXKV_ANTI_ENTROPY_MAX_LAG_LSN", "100000") or "100000")
             self.ANTI_ENTROPY_MAX_AGE_MS = float(os.getenv("PXKV_ANTI_ENTROPY_MAX_AGE_MS", "300000.0") or "300000.0")
 
+            self.CROSS_CLUSTER_ENABLED = os.getenv("PXKV_CROSS_CLUSTER_ENABLED", "false").lower() == "true"
+            self.CLUSTER_ID = os.getenv("PXKV_CLUSTER_ID", "local")
+            self.CROSS_CLUSTER_PEERS = [f for f in os.getenv("PXKV_CROSS_CLUSTER_PEERS", "").split(",") if f]
+            self.CROSS_CLUSTER_CONFLICT_POLICY = os.getenv("PXKV_CROSS_CLUSTER_CONFLICT_POLICY", "last_write_wins").lower()
+
             if self.CONFIG_FILE:
                 try:
                     if os.path.exists(self.CONFIG_FILE):

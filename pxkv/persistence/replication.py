@@ -235,7 +235,16 @@ class ReplicationManager:
             "last_applied_age_ms": float(age_ms),
         }
 
-    def enqueue_change(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None, lsn: int = 0):
+    def enqueue_change(
+        self,
+        op: str,
+        key: Any,
+        value: Any = None,
+        ttl: Optional[float] = None,
+        lsn: int = 0,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ):
         """Called by store when a change happens (Leader only)"""
         if self.role == "leader" and self.followers:
             registry.set_replication_leader_lsn(lsn)
@@ -256,7 +265,9 @@ class ReplicationManager:
                 "key": serialized_key,
                 "value": serialized_val,
                 "ttl": ttl,
-                "ts": time.time()
+                "ts": time.time(),
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
             }
 
             try:
@@ -409,22 +420,55 @@ class ReplicationManager:
             key = change["key"]
             val = change.get("value")
             ttl = change.get("ttl")
+            origin_cluster_id = change.get("origin_cluster_id")
+            origin_ts = change.get("origin_ts")
             
             try:
-                if op == "create":
-                    try:
-                        self.store.create(key, val, ttl, skip_replication=True)
-                    except KeyError:
-                        self.store.update(key, val, ttl, skip_replication=True)
-                elif op == "update":
-                    self.store.update(key, val, ttl, skip_replication=True)
+                if op in ("create", "update"):
+                    should_apply, resolved_val, resolved_ttl = self.store.resolve_conflict(
+                        key, val, ttl,
+                        new_origin_cluster_id=origin_cluster_id,
+                        new_origin_ts=origin_ts,
+                    )
+                    if should_apply:
+                        try:
+                            self.store.create(
+                                key, resolved_val, resolved_ttl,
+                                skip_replication=True,
+                                origin_cluster_id=origin_cluster_id,
+                                origin_ts=origin_ts,
+                            )
+                        except KeyError:
+                            self.store.update(
+                                key, resolved_val, resolved_ttl,
+                                skip_replication=True,
+                                origin_cluster_id=origin_cluster_id,
+                                origin_ts=origin_ts,
+                            )
                 elif op == "delete":
                     try:
                         self.store.delete(key, skip_replication=True)
                     except KeyError:
                         pass
                 elif op == "mset":
-                    self.store.mset(key, ttl, skip_replication=True)
+                    if isinstance(key, dict):
+                        should_apply_all = True
+                        for k, v in key.items():
+                            sa, _, _ = self.store.resolve_conflict(
+                                k, v, ttl,
+                                new_origin_cluster_id=origin_cluster_id,
+                                new_origin_ts=origin_ts,
+                            )
+                            if not sa:
+                                should_apply_all = False
+                                break
+                        if should_apply_all:
+                            self.store.mset(
+                                key, ttl,
+                                skip_replication=True,
+                                origin_cluster_id=origin_cluster_id,
+                                origin_ts=origin_ts,
+                            )
                 elif op == "incr":
                     self.store.incr(key, val, ttl, skip_replication=True)
                 elif op == "persist":

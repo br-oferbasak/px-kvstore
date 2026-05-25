@@ -26,6 +26,7 @@ class LRUKeyValueStore(object):
         self._max = max_size
         self._map: Dict[Any, _Node] = {}
         self._ttl: Dict[Any, Optional[float]] = {}
+        self._xmeta: Dict[Any, Dict[str, Any]] = {}
         self._skeys = _SortedStringKeyIndex()
         self._tiering = tiering
 
@@ -90,7 +91,57 @@ class LRUKeyValueStore(object):
         if node:
             self._remove(node)
         self._ttl.pop(key, None)
+        self._xmeta.pop(key, None)
         self._skeys.discard(key)
+
+    def get_xmeta(self, key: Any) -> Optional[Dict[str, Any]]:
+        """Get cross-cluster metadata for a key (origin_cluster_id, origin_ts)."""
+        with self._lock:
+            return dict(self._xmeta[key]) if key in self._xmeta else None
+
+    def set_xmeta(self, key: Any, meta: Dict[str, Any]) -> None:
+        """Set cross-cluster metadata for a key."""
+        with self._lock:
+            self._xmeta[key] = dict(meta)
+
+    def resolve_conflict(
+        self,
+        key: Any,
+        new_value: Any,
+        new_ttl: Optional[float],
+        new_origin_cluster_id: Optional[str] = None,
+        new_origin_ts: Optional[float] = None,
+        policy: str = "last_write_wins",
+    ) -> Tuple[bool, Any, Optional[float]]:
+        """
+        Resolve cross-cluster conflict.
+        Returns (should_apply, resolved_value, resolved_ttl).
+        """
+        with self._lock:
+            self._purge_expired()
+            node = self._map.get(key)
+            current_meta = self._xmeta.get(key, {})
+            current_origin_ts = current_meta.get("origin_ts", 0.0)
+            current_origin_cluster = current_meta.get("origin_cluster_id", "")
+
+            # If key doesn't exist locally, always apply
+            if node is None:
+                return True, new_value, new_ttl
+
+            if policy == "last_write_wins":
+                if new_origin_ts and new_origin_ts > current_origin_ts:
+                    return True, new_value, new_ttl
+                elif new_origin_ts and new_origin_ts == current_origin_ts:
+                    # Tiebreaker: cluster ID lex order
+                    if new_origin_cluster_id and new_origin_cluster_id > current_origin_cluster:
+                        return True, new_value, new_ttl
+                    else:
+                        return False, node.value, self._ttl.get(key)
+                else:
+                    return False, node.value, self._ttl.get(key)
+
+            # Default: always apply (like before)
+            return True, new_value, new_ttl
 
     def purge_expired(self) -> None:
         with self._lock:
