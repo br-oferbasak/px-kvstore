@@ -473,3 +473,64 @@ class ShardedKeyValueStore(object):
                 continue
             if 0 <= idx < len(self._shards):
                 self._shards[idx].load_state(shard_data)
+
+    def reshard(self, new_shards: int) -> dict:
+        """
+        Reshard the store to use new_shards shards, migrating keys as needed.
+        Returns a summary dict with old_shards, new_shards, keys_migrated.
+        """
+        if new_shards < 1:
+            raise ValueError("new_shards must be >= 1")
+
+        with self._write_lock:
+            old_shards = self._num
+            if old_shards == new_shards:
+                return {"old_shards": old_shards, "new_shards": new_shards, "keys_migrated": 0}
+
+            # Collect all key-value-ttl-xmeta from all old shards
+            all_data = []
+            for shard in self._shards:
+                state = shard.dump_state()
+                for k, rec in state.items():
+                    v = rec.get("value")
+                    ttl = rec.get("ttl")
+                    xmeta = rec.get("xmeta")
+                    all_data.append((k, v, ttl, xmeta))
+
+            # Create new shards
+            self._num = new_shards
+            self._vnodes = [f"vn-{i}-{j}" for j in range(self._vnodes_per_shard) for i in range(self._num)]
+            self._ring = []
+            for n in self._vnodes:
+                hash_val = binascii.crc32(n.encode("utf-8")) & 0xffffffff
+                self._ring.append((hash_val, n, int(n.split("-")[1])))
+            self._ring.sort()
+
+            new_shard_list = []
+            for i in range(self._num):
+                if self._eviction_policy == "lru":
+                    shard = LRUKeyValueStore(max_size=self._per_shard_max)
+                else:
+                    shard = LFUKeyValueStore(max_size=self._per_shard_max)
+                new_shard_list.append(shard)
+            self._shards = new_shard_list
+
+            # Re-insert all data into new shards
+            keys_migrated = 0
+            for k, v, ttl, xmeta in all_data:
+                try:
+                    self._bucket(k).create(k, v, ttl)
+                    if xmeta:
+                        self._bucket(k).set_xmeta(k, xmeta)
+                    keys_migrated += 1
+                except KeyError:
+                    self._bucket(k).update(k, v, ttl)
+                    if xmeta:
+                        self._bucket(k).set_xmeta(k, xmeta)
+                    keys_migrated += 1
+
+            return {
+                "old_shards": old_shards,
+                "new_shards": new_shards,
+                "keys_migrated": keys_migrated,
+            }

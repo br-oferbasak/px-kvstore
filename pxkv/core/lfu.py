@@ -380,13 +380,18 @@ class LFUKeyValueStore(object):
                 if ts is not None and ts <= now:
                     continue
                 ttl_remaining = None if ts is None else max(0.0, ts - now)
-                data[k] = {"value": v, "ttl": ttl_remaining}
+                entry = {"value": v, "ttl": ttl_remaining}
+                xmeta = self._xmeta.get(k)
+                if xmeta:
+                    entry["xmeta"] = dict(xmeta)
+                data[k] = entry
             return data
 
     def load_state(self, data: Dict[str, Dict[str, Any]]) -> None:
         with self._lock:
             self._map.clear()
             self._ttl.clear()
+            self._xmeta.clear()
             self._freq.clear()
             self._last.clear()
             self._seq = 0
@@ -401,3 +406,6 @@ class LFUKeyValueStore(object):
                 self._seq += 1
                 self._last[k] = self._seq
                 self._ttl[k] = None if ttl_remaining is None else now + float(ttl_remaining)
+                xmeta = entry.get("xmeta")
+                if xmeta:
+                    self._xmeta[k] = dict(xmeta)

@@ -106,6 +106,8 @@ class Settings:
             self.CROSS_CLUSTER_PEERS = [f for f in os.getenv("PXKV_CROSS_CLUSTER_PEERS", "").split(",") if f]
             self.CROSS_CLUSTER_CONFLICT_POLICY = os.getenv("PXKV_CROSS_CLUSTER_CONFLICT_POLICY", "last_write_wins").lower()
 
+            self.RESHARD_ENABLED = os.getenv("PXKV_RESHARD_ENABLED", "true").lower() == "true"
+
             if self.CONFIG_FILE:
                 try:
                     if os.path.exists(self.CONFIG_FILE):

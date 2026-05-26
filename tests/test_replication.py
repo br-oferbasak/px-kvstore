@@ -351,3 +351,41 @@ def test_cross_cluster_conflict_resolution_last_write_wins():
         new_origin_ts=time.time() - 100,
     )
     assert should_apply3 is False
+
+
+def test_reshard():
+    from pxkv.core.sharded import ShardedKeyValueStore
+
+    store = ShardedKeyValueStore(shards=2, wal_path="", tiering_dir="")
+
+    # Insert some test keys
+    test_keys = []
+    for i in range(20):
+        k = f"key_{i:02d}"
+        v = f"value_{i:02d}"
+        store.create(k, v)
+        test_keys.append((k, v))
+
+    # Verify all keys are present
+    for k, v in test_keys:
+        assert store.read(k) == v
+
+    # Reshard to 4 shards
+    result = store.reshard(new_shards=4)
+    assert result["old_shards"] == 2
+    assert result["new_shards"] == 4
+    assert result["keys_migrated"] == 20
+
+    # Verify all keys are still present
+    for k, v in test_keys:
+        assert store.read(k) == v
+
+    # Reshard back to 2 shards
+    result2 = store.reshard(new_shards=2)
+    assert result2["old_shards"] == 4
+    assert result2["new_shards"] == 2
+    assert result2["keys_migrated"] == 20
+
+    # Verify all keys are still present
+    for k, v in test_keys:
+        assert store.read(k) == v

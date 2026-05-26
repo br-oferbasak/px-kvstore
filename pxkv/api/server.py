@@ -1142,6 +1142,30 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/config/reload")
                 return
 
+            if parts == ["admin", "reshard"]:
+                if not self._rate_limit("POST /admin/reshard"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                if not getattr(settings, "RESHARD_ENABLED", True):
+                    self._send(403, "Resharding is disabled")
+                    self._inc_metrics("POST", route="POST /admin/reshard", error=True)
+                    return
+                if settings.REPLICATION_ROLE == "follower":
+                    self._reject_readonly(route="POST /admin/reshard")
+                    return
+                payload = json.loads(self._body() or b"{}")
+                new_shards = payload.get("shards")
+                if not isinstance(new_shards, int) or new_shards < 1:
+                    self._send(400, "shards must be an integer >= 1")
+                    self._inc_metrics("POST", route="POST /admin/reshard", error=True)
+                    return
+                result = STORE.reshard(new_shards)
+                settings.SHARDS = new_shards
+                self._json(200, {"status": "ok", **result})
+                self._inc_metrics("POST", route="POST /admin/reshard")
+                return
+
             self._send(404, "Not Found")
             self._inc_metrics("POST", route="POST (not_found)", error=True)
         except ValueError:

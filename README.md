@@ -131,8 +131,8 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **SCAN Cursor**: True cursor-based scan for large keyspaces without `start_after` hacks.
 - [x] **ETag / Conditional GET**: Return ETag for GET /kv and honor If-None-Match to save bandwidth.
 - [x] **Read Repair / Anti-Entropy**: Background verification and repair for follower divergence.
-- [ ] **Multi-Region / Cross-Cluster Replication**: Async replication between clusters with configurable conflict resolution.
-- [ ] **Cluster Autoscaling Hooks**: Integrate with autoscalers to expand or shrink shard count safely.
+- [x] **Multi-Region / Cross-Cluster Replication**: Async replication between clusters with configurable conflict resolution.
+- [x] **Cluster Autoscaling Hooks**: Integrate with autoscalers to expand or shrink shard count safely.
 - [ ] **Point-in-Time Recovery (PITR)**: Restore data to arbitrary LSN or timestamp using WAL + snapshot archives.
 - [ ] **JSON Patch / Partial Updates**: Support atomic JSON patch operations instead of full-value PUTs.
 - [ ] **Compression for On-Disk Data**: Snappy or Zstd compression for WAL and snapshot files.
