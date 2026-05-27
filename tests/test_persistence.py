@@ -57,3 +57,56 @@ def test_wal_rotation_after_snapshot(tmp_path, monkeypatch):
     assert load_snapshot(new_store, snap_path) is True
     recover_from_wal(new_store, new_store._wal)
     assert new_store.read("c1") == 6.0
+
+
+def test_pitr_recover_to_lsn(tmp_path, monkeypatch):
+    from pxkv.persistence.snapshot import recover_to_lsn, recover_to_timestamp, SnapshotManager
+
+    wal_path = str(tmp_path / "wal.log")
+    snap_path = str(tmp_path / "snap.json")
+
+    monkeypatch.setattr(settings, "PITR_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PITR_SNAPSHOT_KEEP", 3, raising=False)
+
+    store = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+
+    # Initial writes
+    store.create("k1", "v1")
+    store.create("k2", "v2")
+
+    # Save snapshot 1
+    manager = SnapshotManager(store, snap_path, 60)
+    manager.snapshot_once()
+
+    lsn_after_snap1 = store._wal._lsn
+
+    # More writes after snapshot 1
+    store.create("k3", "v3")
+    store.update("k1", "v1-updated")
+    store.delete("k2")
+
+    lsn_final = store._wal._lsn
+
+    # Recover to final LSN
+    store1 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+    ok = recover_to_lsn(store1, lsn_final, snap_path, wal_path)
+    assert ok
+    assert store1.read("k1") == "v1-updated"
+    try:
+        store1.read("k2")
+        assert False, "k2 should be deleted"
+    except KeyError:
+        pass
+    assert store1.read("k3") == "v3"
+
+    # Recover to snapshot 1 LSN
+    store2 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+    ok2 = recover_to_lsn(store2, lsn_after_snap1, snap_path, wal_path)
+    assert ok2
+    assert store2.read("k1") == "v1"
+    assert store2.read("k2") == "v2"
+    try:
+        store2.read("k3")
+        assert False, "k3 should not exist yet"
+    except KeyError:
+        pass

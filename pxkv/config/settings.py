@@ -107,6 +107,9 @@ class Settings:
             self.CROSS_CLUSTER_CONFLICT_POLICY = os.getenv("PXKV_CROSS_CLUSTER_CONFLICT_POLICY", "last_write_wins").lower()
 
             self.RESHARD_ENABLED = os.getenv("PXKV_RESHARD_ENABLED", "true").lower() == "true"
+            self.PITR_ENABLED = os.getenv("PXKV_PITR_ENABLED", "true").lower() == "true"
+            self.PITR_SNAPSHOT_KEEP = int(os.getenv("PXKV_PITR_SNAPSHOT_KEEP", "5") or "5")
+            self.PITR_WAL_ARCHIVE_DIR = os.getenv("PXKV_PITR_WAL_ARCHIVE_DIR", "")
 
             if self.CONFIG_FILE:
                 try:

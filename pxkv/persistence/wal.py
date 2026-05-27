@@ -81,6 +81,7 @@ class WAL:
 
         entry = {
             "lsn": self._lsn,
+            "ts": time.time(),
             "op": op,
             "key": key,
             "value": _serialize(value) if value is not None else None,

@@ -1166,6 +1166,74 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/reshard")
                 return
 
+            if parts == ["admin", "pitr", "archives"]:
+                if not self._rate_limit("GET /admin/pitr/archives"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                if not getattr(settings, "PITR_ENABLED", True):
+                    self._send(403, "PITR is disabled")
+                    self._inc_metrics("GET", route="GET /admin/pitr/archives", error=True)
+                    return
+                from pxkv.persistence.snapshot import list_snapshot_archives
+                archives = list_snapshot_archives(settings.SNAPSHOT_FILE)
+                archive_list = []
+                for fpath, lsn in archives:
+                    try:
+                        stat = os.stat(fpath)
+                        archive_list.append({
+                            "path": fpath,
+                            "lsn": lsn,
+                            "size_bytes": stat.st_size,
+                            "mtime": stat.st_mtime,
+                        })
+                    except Exception:
+                        pass
+                self._json(200, {"status": "ok", "archives": archive_list})
+                self._inc_metrics("GET", route="GET /admin/pitr/archives")
+                return
+
+            if parts == ["admin", "pitr", "restore"]:
+                if not self._rate_limit("POST /admin/pitr/restore"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                if not getattr(settings, "PITR_ENABLED", True):
+                    self._send(403, "PITR is disabled")
+                    self._inc_metrics("POST", route="POST /admin/pitr/restore", error=True)
+                    return
+                if settings.REPLICATION_ROLE == "follower":
+                    self._reject_readonly(route="POST /admin/pitr/restore")
+                    return
+                payload = json.loads(self._body() or b"{}")
+                target_lsn = payload.get("lsn")
+                target_ts = payload.get("timestamp")
+                if target_lsn is None and target_ts is None:
+                    self._send(400, "Either 'lsn' or 'timestamp' must be provided")
+                    self._inc_metrics("POST", route="POST /admin/pitr/restore", error=True)
+                    return
+                from pxkv.persistence.snapshot import recover_to_lsn, recover_to_timestamp
+                success = False
+                if target_lsn is not None:
+                    if not isinstance(target_lsn, int) or target_lsn < 0:
+                        self._send(400, "lsn must be a non-negative integer")
+                        self._inc_metrics("POST", route="POST /admin/pitr/restore", error=True)
+                        return
+                    success = recover_to_lsn(STORE, target_lsn, settings.SNAPSHOT_FILE, settings.WAL_FILE)
+                else:
+                    if not isinstance(target_ts, (int, float)):
+                        self._send(400, "timestamp must be a number")
+                        self._inc_metrics("POST", route="POST /admin/pitr/restore", error=True)
+                        return
+                    success = recover_to_timestamp(STORE, float(target_ts), settings.SNAPSHOT_FILE, settings.WAL_FILE)
+                if success:
+                    self._json(200, {"status": "ok"})
+                    self._inc_metrics("POST", route="POST /admin/pitr/restore")
+                else:
+                    self._send(500, "PITR restore failed")
+                    self._inc_metrics("POST", route="POST /admin/pitr/restore", error=True)
+                return
+
             self._send(404, "Not Found")
             self._inc_metrics("POST", route="POST (not_found)", error=True)
         except ValueError:

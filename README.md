@@ -133,7 +133,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Read Repair / Anti-Entropy**: Background verification and repair for follower divergence.
 - [x] **Multi-Region / Cross-Cluster Replication**: Async replication between clusters with configurable conflict resolution.
 - [x] **Cluster Autoscaling Hooks**: Integrate with autoscalers to expand or shrink shard count safely.
-- [ ] **Point-in-Time Recovery (PITR)**: Restore data to arbitrary LSN or timestamp using WAL + snapshot archives.
+- [x] **Point-in-Time Recovery (PITR)**: Restore data to arbitrary LSN or timestamp using WAL + snapshot archives.
 - [ ] **JSON Patch / Partial Updates**: Support atomic JSON patch operations instead of full-value PUTs.
 - [ ] **Compression for On-Disk Data**: Snappy or Zstd compression for WAL and snapshot files.
 - [ ] **Gossip Membership / Discovery**: Auto-discover peers for dynamic follower lists without static config.
