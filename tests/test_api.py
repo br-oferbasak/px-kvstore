@@ -401,3 +401,87 @@ def test_etag_conditional_get():
 
     finally:
         stop_proc(proc)
+
+
+def test_json_patch():
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        # Create a test key with initial value
+        test_key = "patch_test"
+        initial_value = {
+            "name": "John",
+            "age": 30,
+            "skills": ["Python"]
+        }
+        req_put = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            data=json.dumps(initial_value).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_put, timeout=2.0) as resp:
+            assert resp.status in (201, 204)
+
+        # First, apply a simple patch to add a new key and update age
+        patch = [
+            {"op": "replace", "path": "/age", "value": 31},
+            {"op": "add", "path": "/skills/-", "value": "Go"},
+            {"op": "add", "path": "/email", "value": "john@example.com"}
+        ]
+        req_patch = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            data=json.dumps(patch).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        with urllib.request.urlopen(req_patch, timeout=2.0) as resp:
+            assert resp.status == 200
+            etag_patch = resp.headers.get("ETag")
+            assert etag_patch is not None
+            patch_result = json.loads(resp.read().decode("utf-8"))
+            assert patch_result["key"] == test_key
+            assert patch_result["value"]["name"] == "John"
+            assert patch_result["value"]["age"] == 31
+            assert patch_result["value"]["skills"] == ["Python", "Go"]
+            assert patch_result["value"]["email"] == "john@example.com"
+
+        # Verify GET returns the same value
+        with urllib.request.urlopen(f"{base}/kv/{test_key}", timeout=2.0) as resp:
+            assert resp.status == 200
+            get_result = json.loads(resp.read().decode("utf-8"))
+            assert get_result["value"] == patch_result["value"]
+
+        # Now apply a patch to remove a skill
+        patch2 = [
+            {"op": "remove", "path": "/skills/0"}
+        ]
+        req_patch2 = urllib.request.Request(
+            f"{base}/kv/{test_key}",
+            data=json.dumps(patch2).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        with urllib.request.urlopen(req_patch2, timeout=2.0) as resp:
+            assert resp.status == 200
+            patch_result2 = json.loads(resp.read().decode("utf-8"))
+            assert patch_result2["value"]["skills"] == ["Go"]
+
+    finally:
+        stop_proc(proc)

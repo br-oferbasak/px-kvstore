@@ -296,6 +296,53 @@ class ShardedKeyValueStore(object):
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
         return self._bucket(key).read_with_etag(key)
 
+    def patch(
+        self,
+        key: Any,
+        patches: List[Dict[str, Any]],
+        ttl: Optional[float] = None,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> Tuple[Any, str]:
+        """
+        Apply JSON Patch to a key.
+
+        Args:
+            key: The key to patch
+            patches: List of JSON Patch operations
+            ttl: Optional new TTL for the key
+            skip_wal: Whether to skip writing to the WAL
+            skip_replication: Whether to skip replication
+            origin_cluster_id: Cross-cluster origin cluster ID
+            origin_ts: Cross-cluster origin timestamp
+
+        Returns:
+            Tuple of (new_value, new_etag)
+
+        Raises:
+            KeyError: If the key doesn't exist
+        """
+        with self._write_lock:
+            new_value, etag = self._bucket(key).patch(key, patches, ttl)
+            meta = {
+                "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                "origin_ts": origin_ts if origin_ts is not None else time.time(),
+            }
+            self._bucket(key).set_xmeta(key, meta)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("update", key, new_value, ttl)
+            if not skip_replication:
+                self._replication.enqueue_change(
+                    "update", key, new_value, ttl, lsn=lsn,
+                    origin_cluster_id=meta["origin_cluster_id"], origin_ts=meta["origin_ts"],
+                )
+            shard = self._idx(key)
+            notifier.publish("set", key, lsn=lsn, shard=shard)
+            return new_value, etag
+
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
         with self._write_lock:
             self._bucket(key).delete(key)

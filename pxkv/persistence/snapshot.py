@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import glob
+from typing import Optional
 
 from ..config.settings import settings
 

@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: px-kvstore
+Version: 0.1.0
+Summary: A sharded in-memory LRU key-value store with HTTP API, TTL, and extensible architecture.
+Author: Tony Chen
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: jsonpatch>=1.32
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: redis; extra == "dev"
+Provides-Extra: tracing
+Requires-Dist: opentelemetry-api>=1.20; extra == "tracing"
+Requires-Dist: opentelemetry-sdk>=1.20; extra == "tracing"
+Requires-Dist: opentelemetry-exporter-otlp-proto-http>=1.20; extra == "tracing"
+
 # PX-KVStore
 
 **A lightweight, high-performance KV engine for deterministic LLM caching and fast local inference experimentation.**
@@ -134,7 +150,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Multi-Region / Cross-Cluster Replication**: Async replication between clusters with configurable conflict resolution.
 - [x] **Cluster Autoscaling Hooks**: Integrate with autoscalers to expand or shrink shard count safely.
 - [x] **Point-in-Time Recovery (PITR)**: Restore data to arbitrary LSN or timestamp using WAL + snapshot archives.
-- [x] **JSON Patch / Partial Updates**: Support atomic JSON patch operations instead of full-value PUTs.
+- [ ] **JSON Patch / Partial Updates**: Support atomic JSON patch operations instead of full-value PUTs.
 - [ ] **Compression for On-Disk Data**: Snappy or Zstd compression for WAL and snapshot files.
 - [ ] **Gossip Membership / Discovery**: Auto-discover peers for dynamic follower lists without static config.
 - [ ] **Disk Usage Throttling**: Throttle writes when disk usage exceeds configurable thresholds.

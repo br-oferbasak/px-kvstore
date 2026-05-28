@@ -68,7 +68,7 @@ def test_pitr_recover_to_lsn(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "PITR_ENABLED", True, raising=False)
     monkeypatch.setattr(settings, "PITR_SNAPSHOT_KEEP", 3, raising=False)
 
-    store = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+    store = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path)
 
     # Initial writes
     store.create("k1", "v1")
@@ -88,7 +88,7 @@ def test_pitr_recover_to_lsn(tmp_path, monkeypatch):
     lsn_final = store._wal._lsn
 
     # Recover to final LSN
-    store1 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+    store1 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path)
     ok = recover_to_lsn(store1, lsn_final, snap_path, wal_path)
     assert ok
     assert store1.read("k1") == "v1-updated"
@@ -100,7 +100,7 @@ def test_pitr_recover_to_lsn(tmp_path, monkeypatch):
     assert store1.read("k3") == "v3"
 
     # Recover to snapshot 1 LSN
-    store2 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path, snapshot_path=snap_path)
+    store2 = ShardedKeyValueStore(shards=2, per_shard_max=100, wal_path=wal_path)
     ok2 = recover_to_lsn(store2, lsn_after_snap1, snap_path, wal_path)
     assert ok2
     assert store2.read("k1") == "v1"

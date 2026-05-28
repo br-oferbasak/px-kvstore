@@ -957,6 +957,54 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send(404, "Not Found")
             self._inc_metrics("DELETE", route="DELETE (not_found)", error=True)
 
+    def do_PATCH(self) -> None:
+        self._request_id = uuid.uuid4().hex
+        self._request_started_at = time.time()
+        self._fault_sleep()
+        with tracing.extract_context(self.headers), self._request_span("PATCH") as span:
+            self._span = span
+            self._do_PATCH_inner()
+
+    def _do_PATCH_inner(self) -> None:
+        try:
+            if not self._rate_limit("PATCH /kv/:key"):
+                return
+            if not self._require_role(ROLE_WRITER):
+                return
+            if settings.REPLICATION_ROLE == "follower":
+                self._reject_readonly(route="PATCH /kv/:key")
+                return
+            parts, query = self._parse()
+            if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
+                raise ValueError
+            key = parts[1]
+            ttl = float(query["ttl"][0]) if "ttl" in query else None
+            raw = self._body()
+            try:
+                patches = json.loads(raw or b"")
+            except ValueError:
+                self._send(400, "Invalid JSON Patch payload")
+                self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
+                return
+            if not isinstance(patches, list):
+                self._send(400, "JSON Patch payload must be an array of operations")
+                self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
+                return
+            new_value, etag = STORE.patch(key, patches, ttl)
+            headers = self._staleness_headers()
+            headers["ETag"] = etag
+            self._json(200, {"key": key, "value": new_value}, headers=headers)
+            self._inc_metrics("PATCH", route="PATCH /kv/:key")
+        except KeyError as e:
+            self._send(404, str(e))
+            self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
+        except ValueError:
+            self._send(404, "Not Found")
+            self._inc_metrics("PATCH", route="PATCH (not_found)", error=True)
+        except Exception as e:
+            self._send(400, str(e))
+            self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
+
     def do_POST(self) -> None:
         self._request_id = uuid.uuid4().hex
         self._request_started_at = time.time()

@@ -9,6 +9,12 @@ from threading import Lock
 from .base import _SortedStringKeyIndex
 from ..tiering.base import TieringBackend
 
+try:
+    import jsonpatch
+    HAS_JSONPATCH = True
+except ImportError:
+    HAS_JSONPATCH = False
+
 class _Node(object):
     def __init__(self, key: Any, value: Any):
         self.key = key
@@ -262,6 +268,65 @@ class LRUKeyValueStore(object):
             if ttl is not None:
                 self._ttl[key] = time.time() + ttl
             self._evict_if_needed()
+
+    def patch(self, key: Any, patches: List[Dict[str, Any]], ttl: Optional[float] = None) -> Tuple[Any, str]:
+        """
+        Apply JSON Patch to a key.
+
+        Args:
+            key: The key to patch
+            patches: List of JSON Patch operations
+            ttl: Optional new TTL for the key
+
+        Returns:
+            Tuple of (new_value, new_etag)
+
+        Raises:
+            KeyError: If the key doesn't exist
+            ValueError: If jsonpatch library is not installed
+            jsonpatch.JsonPatchException: If patch application fails
+        """
+        if not HAS_JSONPATCH:
+            raise ValueError("jsonpatch library not installed")
+        with self._lock:
+            self._purge_expired()
+            node = self._map.get(key)
+            if node is None:
+                if self._tiering is not None:
+                    try:
+                        hit = self._tiering.get(key)
+                        if hit is not None:
+                            node = _Node(key, hit.value)
+                            self._map[key] = node
+                            self._append(node)
+                            self._skeys.add(key)
+                            if hit.ttl_remaining is None:
+                                self._ttl[key] = None
+                            else:
+                                self._ttl[key] = time.time() + float(hit.ttl_remaining)
+                            try:
+                                self._tiering.delete(key)
+                            except Exception:
+                                pass
+                            self._evict_if_needed()
+                    except Exception:
+                        pass
+                if node is None:
+                    raise KeyError(key)
+            if self._tiering is not None:
+                try:
+                    self._tiering.delete(key)
+                except Exception:
+                    pass
+            new_value = jsonpatch.apply_patch(node.value, patches)
+            node.value = new_value
+            self._move_to_tail(node)
+            if ttl is not None:
+                self._ttl[key] = time.time() + ttl
+            self._evict_if_needed()
+            current_ttl = self._ttl.get(key)
+            etag = self._compute_etag(new_value, current_ttl)
+            return new_value, etag
 
     def delete(self, key: Any) -> None:
         with self._lock:
