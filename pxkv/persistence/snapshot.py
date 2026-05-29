@@ -7,16 +7,29 @@ import os
 import threading
 import time
 import glob
+import gzip
 from typing import Optional
 
 from ..config.settings import settings
 
 def load_snapshot(store, path: str) -> bool:
-    if not path or not os.path.exists(path):
+    if not path:
+        return False
+    file_to_read = path
+    if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
+        if not file_to_read.endswith(".gz"):
+            file_to_read = file_to_read + ".gz"
+        if not os.path.exists(file_to_read):
+            file_to_read = path
+    if not os.path.exists(file_to_read):
         return False
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
+        if file_to_read.endswith(".gz"):
+            with gzip.open(file_to_read, "rt") as f:
+                data = json.load(f)
+        else:
+            with open(file_to_read, "r") as f:
+                data = json.load(f)
         if isinstance(data, dict) and "_lsn" in data:
             try:
                 store._wal._lsn = max(int(store._wal._lsn), int(data.get("_lsn", 0) or 0))
@@ -28,10 +41,10 @@ def load_snapshot(store, path: str) -> bool:
             except Exception:
                 pass
         store.load(data)
-        logging.info("Restored state from %s", path)
+        logging.info("Restored state from %s", file_to_read)
         return True
     except Exception as e:
-        logging.error("Failed to load snapshot from %s: %s", path, e)
+        logging.error("Failed to load snapshot from %s: %s", file_to_read, e)
         return False
 
 
@@ -40,13 +53,18 @@ def list_snapshot_archives(base_path: str) -> list:
     archives = []
     if not base_path:
         return archives
-    pattern = f"{base_path}.*.archive"
+    pattern = f"{base_path}.*.archive*"
     files = glob.glob(pattern)
     for fpath in files:
         try:
             parts = fpath.split(".")
-            if len(parts) >= 3 and parts[-2].isdigit():
-                lsn = int(parts[-2])
+            lsn_idx = None
+            for i, part in enumerate(parts):
+                if part == "archive":
+                    lsn_idx = i - 1
+                    break
+            if lsn_idx is not None and lsn_idx >= 0 and parts[lsn_idx].isdigit():
+                lsn = int(parts[lsn_idx])
                 archives.append((fpath, lsn))
         except Exception:
             pass
@@ -75,13 +93,23 @@ def find_snapshot_for_lsn(base_path: str, target_lsn: int) -> Optional[str]:
         if lsn <= target_lsn:
             return fpath
     # If no archive matches, check the main snapshot
-    if os.path.exists(base_path):
+    file_to_check = base_path
+    if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
+        if not file_to_check.endswith(".gz"):
+            file_to_check = file_to_check + ".gz"
+        if not os.path.exists(file_to_check):
+            file_to_check = base_path
+    if os.path.exists(file_to_check):
         try:
-            with open(base_path, "r") as f:
-                data = json.load(f)
+            if file_to_check.endswith(".gz"):
+                with gzip.open(file_to_check, "rt") as f:
+                    data = json.load(f)
+            else:
+                with open(file_to_check, "r") as f:
+                    data = json.load(f)
             lsn = int(data.get("_lsn", 0) or 0)
             if lsn <= target_lsn:
-                return base_path
+                return file_to_check
         except Exception:
             pass
     return None
@@ -104,19 +132,33 @@ class SnapshotManager(threading.Thread):
             payload = dict(data)
             payload["_lsn"] = int(lsn)
             payload["_ts"] = time.time()
-            with open(tmp, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp, self.path)
-            logging.info("Saved snapshot to %s", self.path)
+            
+            if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
+                tmp_gz = f"{self.path}.tmp.gz"
+                with gzip.open(tmp_gz, "wt", compresslevel=int(getattr(settings, "COMPRESSION_LEVEL", 6))) as f:
+                    json.dump(payload, f)
+                os.replace(tmp_gz, self.path + ".gz")
+                logging.info("Saved compressed snapshot to %s.gz", self.path)
+            else:
+                with open(tmp, "w") as f:
+                    json.dump(payload, f)
+                os.replace(tmp, self.path)
+                logging.info("Saved snapshot to %s", self.path)
             
             # Also save an archived version if PITR is enabled
             if getattr(settings, "PITR_ENABLED", True):
                 try:
                     ts = int(time.time())
                     archive_path = f"{self.path}.{lsn}.{ts}.archive"
-                    with open(archive_path, "w") as f:
-                        json.dump(payload, f)
-                    logging.info("Saved snapshot archive to %s", archive_path)
+                    if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
+                        archive_path_gz = archive_path + ".gz"
+                        with gzip.open(archive_path_gz, "wt", compresslevel=int(getattr(settings, "COMPRESSION_LEVEL", 6))) as f:
+                            json.dump(payload, f)
+                        logging.info("Saved compressed snapshot archive to %s", archive_path_gz)
+                    else:
+                        with open(archive_path, "w") as f:
+                            json.dump(payload, f)
+                        logging.info("Saved snapshot archive to %s", archive_path)
                     keep = int(getattr(settings, "PITR_SNAPSHOT_KEEP", 5))
                     prune_snapshot_archives(self.path, keep)
                 except Exception as e:
@@ -130,11 +172,12 @@ class SnapshotManager(threading.Thread):
                     logging.warning("WAL rotation failed: %s", e)
         except Exception as e:
             logging.error("Failed to save snapshot: %s", e)
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except:
-                    pass
+            for tmp_file in [tmp, f"{self.path}.tmp.gz"]:
+                if os.path.exists(tmp_file):
+                    try:
+                        os.remove(tmp_file)
+                    except:
+                        pass
 
     def stop(self) -> None:
         self._stop_event.set()

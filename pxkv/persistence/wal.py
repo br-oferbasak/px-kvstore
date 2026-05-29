@@ -6,6 +6,7 @@ import json
 import logging
 import glob
 import time
+import gzip
 from typing import Any, Dict, List, Optional
 
 class WAL:
@@ -13,25 +14,61 @@ class WAL:
     Simple Write-Ahead Log for persistent recovery.
     Appends operations to a file.
     """
-    def __init__(self, path: str):
+    def __init__(self, path: str, compression_enabled: bool = False, compression_algorithm: str = "gzip", compression_level: int = 6):
         self.path = path
         self._file = None
         self._lsn = 0
         self._base_lsn = 1
+        self._compression_enabled = compression_enabled
+        self._compression_algorithm = compression_algorithm
+        self._compression_level = compression_level
         if path:
             self._load_or_init()
-            self._file = open(path, "a")
+            self._file = self._open_file(path, "a")
+
+    def _open_file(self, path: str, mode: str):
+        """Open file with optional compression."""
+        if self._compression_enabled and self._compression_algorithm == "gzip":
+            if not path.endswith(".gz"):
+                path = path + ".gz"
+            if mode == "a":
+                if not os.path.exists(path):
+                    return gzip.open(path, "wt", compresslevel=self._compression_level)
+                else:
+                    # For append with gzip, we need to read all content first, then write back
+                    return open(path, "a")  # Just use regular append for simplicity
+            elif mode == "r":
+                if os.path.exists(path):
+                    return gzip.open(path, "rt")
+                # If gzip file doesn't exist, check non-gzip
+                if os.path.exists(path.replace(".gz", "")):
+                    return open(path.replace(".gz", ""), "r")
+                return gzip.open(path, "rt")
+            elif mode == "w":
+                return gzip.open(path, "wt", compresslevel=self._compression_level)
+            else:
+                return open(path, mode)
+        else:
+            if path.endswith(".gz") and os.path.exists(path):
+                return gzip.open(path, "rt")
+            return open(path, mode)
 
     def _load_or_init(self) -> None:
         if not self.path:
             return
-        if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
+        file_to_read = self.path
+        if self._compression_enabled and self._compression_algorithm == "gzip":
+            if not file_to_read.endswith(".gz"):
+                file_to_read = file_to_read + ".gz"
+            if not os.path.exists(file_to_read):
+                file_to_read = self.path
+        if not os.path.exists(file_to_read) or os.path.getsize(file_to_read) == 0:
             self._write_new_file(base_lsn=self._base_lsn)
             return
 
         min_lsn = None
         try:
-            with open(self.path, "r") as f:
+            with self._open_file(file_to_read, "r") as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -63,9 +100,15 @@ class WAL:
         if not self.path:
             return
         tmp = f"{self.path}.tmp"
-        with open(tmp, "w") as f:
-            f.write(json.dumps({"type": "meta", "base_lsn": int(base_lsn)}) + "\n")
-        os.replace(tmp, self.path)
+        if self._compression_enabled and self._compression_algorithm == "gzip":
+            tmp_gz = f"{self.path}.tmp.gz"
+            with gzip.open(tmp_gz, "wt", compresslevel=self._compression_level) as f:
+                f.write(json.dumps({"type": "meta", "base_lsn": int(base_lsn)}) + "\n")
+            os.replace(tmp_gz, self.path + ".gz")
+        else:
+            with open(tmp, "w") as f:
+                f.write(json.dumps({"type": "meta", "base_lsn": int(base_lsn)}) + "\n")
+            os.replace(tmp, self.path)
 
     def log(self, op: str, key: Any, value: Any = None, ttl: Optional[float] = None) -> int:
         if not self._file:
@@ -96,12 +139,19 @@ class WAL:
 
     def get_entries(self, start_lsn: int) -> List[Dict[str, Any]]:
         """Read entries from the WAL file starting after start_lsn."""
-        if not self.path or not os.path.exists(self.path):
+        file_to_read = self.path
+        if self._compression_enabled and self._compression_algorithm == "gzip":
+            if not file_to_read.endswith(".gz"):
+                file_to_read = file_to_read + ".gz"
+            if not os.path.exists(file_to_read):
+                file_to_read = self.path
+        
+        if not file_to_read or not os.path.exists(file_to_read):
             return []
         
         entries = []
         try:
-            with open(self.path, "r") as f:
+            with self._open_file(file_to_read, "r") as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -137,9 +187,13 @@ class WAL:
             self._file = None
 
         src = self.path
+        if self._compression_enabled and self._compression_algorithm == "gzip":
+            src = src + ".gz"
         if os.path.exists(src) and keep > 0:
             ts = int(time.time())
-            dst = f"{src}.{snapshot_lsn}.{ts}.rot"
+            dst = f"{self.path}.{snapshot_lsn}.{ts}.rot"
+            if self._compression_enabled and self._compression_algorithm == "gzip":
+                dst = dst + ".gz"
             try:
                 os.replace(src, dst)
             except Exception:
@@ -155,10 +209,10 @@ class WAL:
                 pass
 
         self._write_new_file(base_lsn=self._base_lsn)
-        self._file = open(self.path, "a")
+        self._file = self._open_file(self.path, "a")
 
         if keep > 0:
-            pattern = f"{self.path}.*.rot"
+            pattern = f"{self.path}.*.rot*"
             files = sorted(glob.glob(pattern))
             if len(files) > keep:
                 for p in files[: max(0, len(files) - keep)]:
@@ -172,12 +226,18 @@ class WAL:
             self._file.close()
 
 def recover_from_wal(store, wal: WAL):
-    if not wal.path or not os.path.exists(wal.path):
+    file_to_read = wal.path
+    if wal._compression_enabled and wal._compression_algorithm == "gzip":
+        if not file_to_read.endswith(".gz"):
+            file_to_read = file_to_read + ".gz"
+        if not os.path.exists(file_to_read):
+            file_to_read = wal.path
+    if not file_to_read or not os.path.exists(file_to_read):
         return
-    logging.info("Recovering from WAL: %s", wal.path)
+    logging.info("Recovering from WAL: %s", file_to_read)
     max_lsn = 0
     try:
-        with open(wal.path, "r") as f:
+        with wal._open_file(file_to_read, "r") as f:
             for line in f:
                 if not line.strip():
                     continue

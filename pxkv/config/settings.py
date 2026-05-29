@@ -110,6 +110,10 @@ class Settings:
             self.PITR_ENABLED = os.getenv("PXKV_PITR_ENABLED", "true").lower() == "true"
             self.PITR_SNAPSHOT_KEEP = int(os.getenv("PXKV_PITR_SNAPSHOT_KEEP", "5") or "5")
             self.PITR_WAL_ARCHIVE_DIR = os.getenv("PXKV_PITR_WAL_ARCHIVE_DIR", "")
+            
+            self.COMPRESSION_ENABLED = os.getenv("PXKV_COMPRESSION_ENABLED", "false").lower() == "true"
+            self.COMPRESSION_ALGORITHM = os.getenv("PXKV_COMPRESSION_ALGORITHM", "gzip").lower()
+            self.COMPRESSION_LEVEL = int(os.getenv("PXKV_COMPRESSION_LEVEL", "6") or "6")
 
             if self.CONFIG_FILE:
                 try:

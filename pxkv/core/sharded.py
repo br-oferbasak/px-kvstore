@@ -101,7 +101,12 @@ class ShardedKeyValueStore(object):
                 self._ring.append((h, i))
         self._ring.sort()
 
-        self._wal = WAL(wal_path)
+        self._wal = WAL(
+            wal_path,
+            compression_enabled=getattr(settings, "COMPRESSION_ENABLED", False),
+            compression_algorithm=getattr(settings, "COMPRESSION_ALGORITHM", "gzip"),
+            compression_level=getattr(settings, "COMPRESSION_LEVEL", 6)
+        )
         self._replication = ReplicationManager(self)
 
     def _hash_key_material(self, key: Any) -> bytes:
