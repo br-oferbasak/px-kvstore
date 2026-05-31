@@ -114,6 +114,11 @@ class Settings:
             self.COMPRESSION_ENABLED = os.getenv("PXKV_COMPRESSION_ENABLED", "false").lower() == "true"
             self.COMPRESSION_ALGORITHM = os.getenv("PXKV_COMPRESSION_ALGORITHM", "gzip").lower()
             self.COMPRESSION_LEVEL = int(os.getenv("PXKV_COMPRESSION_LEVEL", "6") or "6")
+            
+            self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
+            self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
+            self.GOSSIP_FAILURE_TIMEOUT = float(os.getenv("PXKV_GOSSIP_FAILURE_TIMEOUT", "5.0") or "5.0")
+            self.GOSSIP_SEED_PEERS = [p.strip() for p in os.getenv("PXKV_GOSSIP_SEED_PEERS", "").split(",") if p.strip()]
 
             if self.CONFIG_FILE:
                 try:

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..config.settings import settings
 from ..metrics.registry import registry
 from .. import tracing
+from .gossip import get_gossip_membership
 
 def _http_get_json(url: str, timeout: float) -> Tuple[int, Any, str]:
     headers: Dict[str, str] = {}
@@ -84,6 +85,62 @@ class ReplicationManager:
         self._last_applied_lsn = 0
         self._last_applied_at = 0.0
         self._known_leader_lsn = 0
+        
+        # Gossip integration
+        self._initialize_gossip()
+
+    def _initialize_gossip(self) -> None:
+        if not getattr(settings, "GOSSIP_ENABLED", False):
+            return
+
+        gossip = get_gossip_membership()
+        if gossip:
+            gossip.on_membership_change(self._on_membership_change)
+            if self.role == "leader":
+                # For leader: all alive peers except itself are potential followers
+                alive = gossip.get_alive_peers()
+                # Filter out ourself from followers list
+                if gossip.self_addr in alive:
+                    alive.remove(gossip.self_addr)
+                # Update followers
+                self._update_followers(alive)
+            elif self.role == "follower":
+                # For follower: find potential leaders
+                pass
+
+    def _on_membership_change(self, alive_peers: List[str]) -> None:
+        if self.role == "leader":
+            # Update followers list from gossip
+            # All alive peers except ourselves
+            gossip = get_gossip_membership()
+            if gossip:
+                filtered = [p for p in alive_peers if p != gossip.self_addr]
+                self._update_followers(filtered)
+        elif self.role == "follower":
+            # For follower: update followers list from gossip for follower reads
+            gossip = get_gossip_membership()
+            if gossip:
+                filtered = [p for p in alive_peers if p != gossip.self_addr]
+                self.followers = filtered
+
+    def _update_followers(self, new_followers: List[str]) -> None:
+        existing = set(self.followers)
+        new = set(new_followers)
+        
+        added = new - existing
+        removed = existing - new
+        
+        for peer in added:
+            if peer not in self._follower_ack_lsn:
+                self._follower_ack_lsn[peer] = 0
+            logging.info(f"New follower discovered via gossip: {peer}")
+        
+        for peer in removed:
+            if peer in self._follower_ack_lsn:
+                del self._follower_ack_lsn[peer]
+            logging.info(f"Follower removed: {peer} removed from follower list")
+        
+        self.followers = list(new_followers)
 
     def start(self):
         if self.role == "leader":

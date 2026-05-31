@@ -33,6 +33,7 @@ from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 from ..notifications import notifier
 from .. import tracing
+from ..persistence.gossip import initialize_gossip, get_gossip_membership
 
 def _server_ssl_context(cert_file: str, key_file: str) -> Optional[ssl.SSLContext]:
     if not cert_file or not key_file:
@@ -92,6 +93,19 @@ _SNAPSHOT_MANAGER: SnapshotManager | None = None
 if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
     _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
     _SNAPSHOT_MANAGER.start()
+
+# Initialize gossip membership
+_GOSSIP = None
+if getattr(settings, "GOSSIP_ENABLED", False):
+    self_addr = f"{settings.HOST}:{settings.PORT}"
+    _GOSSIP = initialize_gossip(
+        self_addr=self_addr,
+        interval=getattr(settings, "GOSSIP_INTERVAL", 1.0),
+        failure_timeout=getattr(settings, "GOSSIP_FAILURE_TIMEOUT", 5.0),
+        seed_peers=getattr(settings, "GOSSIP_SEED_PEERS", []),
+    )
+    _GOSSIP.start()
+    logging.info(f"Gossip membership initialized at {self_addr}, seed peers: {getattr(settings, 'GOSSIP_SEED_PEERS', [])}")
 
 class _TokenBucket:
     def __init__(self, rate_per_sec: float, capacity: int):
@@ -732,6 +746,32 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("GET", route="GET /replication/wal")
                 return
 
+            if parts == ["gossip", "membership"]:
+                if not self._rate_limit("GET /gossip/membership"):
+                    return
+                gossip = get_gossip_membership()
+                if not gossip:
+                    self._json(200, {"enabled": False, "peers": [], "alive_peers": []})
+                    self._inc_metrics("GET", route="GET /gossip/membership")
+                    return
+                with gossip._lock:
+                    peers_list = []
+                    for addr, peer in gossip.peers.items():
+                        peers_list.append({
+                            "addr": addr,
+                            "alive": peer.is_alive,
+                            "incarnation": peer.incarnation,
+                            "last_seen": peer.last_seen
+                        })
+                self._json(200, {
+                    "enabled": True,
+                    "self_addr": gossip.self_addr,
+                    "peers": peers_list,
+                    "alive_peers": gossip.get_alive_peers(),
+                })
+                self._inc_metrics("GET", route="GET /gossip/membership")
+                return
+
             if parts[0] == "admin":
                 if not self._require_role(ROLE_ADMIN):
                     return
@@ -1038,6 +1078,61 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     },
                 )
                 self._inc_metrics("POST", route="POST /replication/sync")
+                return
+
+            if parts == ["gossip", "membership"]:
+                if not self._rate_limit("POST /gossip/membership"):
+                    return
+                gossip = get_gossip_membership()
+                if not gossip:
+                    self._json(200, {"status": "gossip not enabled"})
+                    self._inc_metrics("POST", route="POST /gossip/membership")
+                    return
+                try:
+                    payload = json.loads(self._body() or b"{}")
+                except ValueError:
+                    self._send(400, "Invalid JSON payload")
+                    self._inc_metrics("POST", route="POST /gossip/membership", error=True)
+                    return
+                
+                # First, if sender is a peer we don't know, add them
+                sender_addr = payload.get("addr")
+                if sender_addr and sender_addr != gossip.self_addr:
+                    gossip.add_peer(sender_addr)
+                
+                # Now process their peer list
+                their_peers = payload.get("peers", {})
+                if isinstance(their_peers, dict):
+                    for addr, peer_info in their_peers.items():
+                        if addr == gossip.self_addr:
+                            continue
+                        # Check if this is a new peer
+                        is_alive = bool(peer_info.get("alive", True))
+                        incarnation = int(peer_info.get("incarnation", 0))
+                        gossip.update_peer(addr, is_alive, incarnation)
+                
+                # Return our own membership state
+                with gossip._lock:
+                    peers_list = []
+                    for addr, peer in gossip.peers.items():
+                        peers_list.append({
+                            "addr": addr,
+                            "alive": peer.is_alive,
+                            "incarnation": peer.incarnation,
+                            "last_seen": peer.last_seen
+                        })
+                
+                self._json(200, {
+                    "addr": gossip.self_addr,
+                    "peers": {
+                        addr: {
+                            "alive": peer.is_alive,
+                            "incarnation": peer.incarnation,
+                            "last_seen": peer.last_seen
+                        } for addr, peer in gossip.peers.items()
+                    }
+                })
+                self._inc_metrics("POST", route="POST /gossip/membership")
                 return
 
             if len(parts) >= 1 and parts[0] == "ai":

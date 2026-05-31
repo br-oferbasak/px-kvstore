@@ -136,7 +136,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Point-in-Time Recovery (PITR)**: Restore data to arbitrary LSN or timestamp using WAL + snapshot archives.
 - [x] **JSON Patch / Partial Updates**: Support atomic JSON patch operations instead of full-value PUTs.
 - [x] **Compression for On-Disk Data**: Gzip compression for WAL and snapshot files.
-- [ ] **Gossip Membership / Discovery**: Auto-discover peers for dynamic follower lists without static config.
+- [x] **Gossip Membership / Discovery**: Auto-discover peers for dynamic follower lists without static config.
 - [ ] **Disk Usage Throttling**: Throttle writes when disk usage exceeds configurable thresholds.
 - [ ] **Multi-Tenancy (Namespaces)**: Isolate keyspaces into distinct namespaces with separate auth/rate limits.
 - [ ] **Hot Key Detection**: Identify and flag frequently accessed keys for optimization.
