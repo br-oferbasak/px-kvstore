@@ -33,6 +33,7 @@ from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 from ..notifications import notifier
 from .. import tracing
+from ..persistence.disk_throttle import disk_throttler
 from ..persistence.gossip import initialize_gossip, get_gossip_membership
 
 def _server_ssl_context(cert_file: str, key_file: str) -> Optional[ssl.SSLContext]:
@@ -93,6 +94,8 @@ _SNAPSHOT_MANAGER: SnapshotManager | None = None
 if settings.SNAPSHOT_FILE and settings.SNAPSHOT_INTERVAL > 0:
     _SNAPSHOT_MANAGER = SnapshotManager(STORE, settings.SNAPSHOT_FILE, settings.SNAPSHOT_INTERVAL)
     _SNAPSHOT_MANAGER.start()
+
+registry.observe_disk_usage(disk_throttler.sample(force=True))
 
 # Initialize gossip membership
 _GOSSIP = None
@@ -357,6 +360,29 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def _reject_readonly(self, route: str) -> None:
         self._send(403, "READONLY You can't write against a read-only follower.", headers=self._staleness_headers())
         self._inc_metrics("WRITE", route=route, error=True)
+
+    def _enforce_disk_write_budget(self, route: str) -> bool:
+        decision = disk_throttler.gate_write()
+        registry.observe_disk_usage(decision)
+        delay_ms = float(decision.get("delay_ms", 0.0) or 0.0)
+        if delay_ms > 0 and not decision.get("rejected", False):
+            registry.inc_disk_throttle(delay_ms)
+        if not decision.get("rejected", False):
+            return True
+
+        reason = str(decision.get("reason", "") or "disk usage threshold exceeded")
+        registry.inc_disk_reject(reason)
+        body = {
+            "error": "disk_throttled",
+            "reason": reason,
+            "path": decision.get("last_path", ""),
+            "used_percent": float(decision.get("used_percent", 0.0) or 0.0),
+            "used_bytes": int(decision.get("used_bytes", 0) or 0),
+            "free_bytes": int(decision.get("free_bytes", 0) or 0),
+        }
+        self._json(507, body)
+        self._inc_metrics(self.command or "WRITE", route=route, error=True)
+        return False
 
     def _auth_enabled(self) -> bool:
         return any(
@@ -941,6 +967,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="PUT /kv/:key")
                 return
+            if not self._enforce_disk_write_budget("PUT /kv/:key"):
+                return
             parts, query = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
@@ -1013,6 +1041,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="PATCH /kv/:key")
+                return
+            if not self._enforce_disk_write_budget("PATCH /kv/:key"):
                 return
             parts, query = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
@@ -1174,6 +1204,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     if settings.REPLICATION_ROLE == "follower":
                         self._reject_readonly(route="POST /ai/cache")
                         return
+                    if not self._enforce_disk_write_budget("POST /ai/cache"):
+                        return
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
                     model = payload.get("model", "")
@@ -1215,6 +1247,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/incr/:key")
                     return
+                if not self._enforce_disk_write_budget("POST /kv/incr/:key"):
+                    return
                 key = parts[2]
                 delta = 1.0
                 ttl = None
@@ -1249,6 +1283,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/batch")
+                    return
+                if not self._enforce_disk_write_budget("POST /kv/batch"):
                     return
                 payload = json.loads(self._body() or b"{}")
                 items = payload.get("items", {})
@@ -1296,6 +1332,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /admin/reshard")
+                    return
+                if not self._enforce_disk_write_budget("POST /admin/reshard"):
                     return
                 payload = json.loads(self._body() or b"{}")
                 new_shards = payload.get("shards")
@@ -1348,6 +1386,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /admin/pitr/restore")
                     return
+                if not self._enforce_disk_write_budget("POST /admin/pitr/restore"):
+                    return
                 payload = json.loads(self._body() or b"{}")
                 target_lsn = payload.get("lsn")
                 target_ts = payload.get("timestamp")
@@ -1394,6 +1434,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._rate_limit("GET /admin/health"):
                 return
             repl = STORE._replication.get_staleness() if settings.REPLICATION_ROLE == "follower" else None
+            disk = disk_throttler.sample(force=True)
+            registry.observe_disk_usage(disk)
             self._json(
                 200,
                 {
@@ -1401,6 +1443,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     "uptime_seconds": time.time() - registry.get_all()["started_at"],
                     "shards": settings.SHARDS,
                     "replication": repl,
+                    "disk": disk,
                 },
             )
             self._inc_metrics("GET", route="GET /admin/health")

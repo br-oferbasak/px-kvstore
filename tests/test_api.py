@@ -485,3 +485,55 @@ def test_json_patch():
 
     finally:
         stop_proc(proc)
+
+
+def test_disk_usage_throttling_blocks_writes(tmp_path):
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+    env["PXKV_DISK_THROTTLE_ENABLED"] = "true"
+    env["PXKV_DISK_THROTTLE_PATHS"] = str(tmp_path)
+    env["PXKV_DISK_THROTTLE_HARD_USED_BYTES"] = "1"
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        req = urllib.request.Request(
+            f"{base}/kv/disk_guard_key",
+            data=json.dumps({"value": "blocked"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2.0)
+            raise AssertionError("expected 507")
+        except urllib.error.HTTPError as e:
+            assert e.code == 507
+            body = json.loads(e.read().decode("utf-8"))
+            assert body["error"] == "disk_throttled"
+            assert body["used_bytes"] >= 1
+
+        with urllib.request.urlopen(f"{base}/admin/health", timeout=2.0) as resp:
+            assert resp.status == 200
+            health = json.loads(resp.read().decode("utf-8"))
+        assert health["disk"]["enabled"] is True
+        assert health["disk"]["hard_exceeded"] is True
+
+        with urllib.request.urlopen(f"{base}/admin/metrics", timeout=2.0) as resp:
+            assert resp.status == 200
+            metrics = json.loads(resp.read().decode("utf-8"))
+        assert metrics["disk"]["rejected_total"] >= 1
+    finally:
+        stop_proc(proc)

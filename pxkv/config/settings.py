@@ -114,6 +114,14 @@ class Settings:
             self.COMPRESSION_ENABLED = os.getenv("PXKV_COMPRESSION_ENABLED", "false").lower() == "true"
             self.COMPRESSION_ALGORITHM = os.getenv("PXKV_COMPRESSION_ALGORITHM", "gzip").lower()
             self.COMPRESSION_LEVEL = int(os.getenv("PXKV_COMPRESSION_LEVEL", "6") or "6")
+
+            self.DISK_THROTTLE_ENABLED = os.getenv("PXKV_DISK_THROTTLE_ENABLED", "false").lower() == "true"
+            self.DISK_THROTTLE_PATHS = [p.strip() for p in os.getenv("PXKV_DISK_THROTTLE_PATHS", "").split(",") if p.strip()]
+            self.DISK_THROTTLE_SOFT_PERCENT = float(os.getenv("PXKV_DISK_THROTTLE_SOFT_PERCENT", "0") or "0")
+            self.DISK_THROTTLE_HARD_PERCENT = float(os.getenv("PXKV_DISK_THROTTLE_HARD_PERCENT", "0") or "0")
+            self.DISK_THROTTLE_SOFT_USED_BYTES = int(os.getenv("PXKV_DISK_THROTTLE_SOFT_USED_BYTES", "0") or "0")
+            self.DISK_THROTTLE_HARD_USED_BYTES = int(os.getenv("PXKV_DISK_THROTTLE_HARD_USED_BYTES", "0") or "0")
+            self.DISK_THROTTLE_DELAY_MS = float(os.getenv("PXKV_DISK_THROTTLE_DELAY_MS", "0") or "0")
             
             self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
             self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
@@ -157,6 +165,12 @@ class Settings:
                 "REPLICATION_SYNC_INTERVAL": float,
                 "REDIS_ENABLED": _to_bool,
                 "RATE_LIMIT_ENABLED": _to_bool,
+                "DISK_THROTTLE_ENABLED": _to_bool,
+                "DISK_THROTTLE_SOFT_PERCENT": float,
+                "DISK_THROTTLE_HARD_PERCENT": float,
+                "DISK_THROTTLE_SOFT_USED_BYTES": int,
+                "DISK_THROTTLE_HARD_USED_BYTES": int,
+                "DISK_THROTTLE_DELAY_MS": float,
             }
             for key, val in new_settings.items():
                 if key in updatable:
@@ -190,6 +204,16 @@ class Settings:
                         logging.info("Setting RATE_LIMIT_ROUTES updated (%d routes)", len(self.RATE_LIMIT_ROUTES))
                     except Exception as e:
                         logging.warning("Failed to update setting RATE_LIMIT_ROUTES: %s", e)
+                elif key == "DISK_THROTTLE_PATHS":
+                    try:
+                        if isinstance(val, str):
+                            val = [p.strip() for p in val.split(",") if p.strip()]
+                        if not isinstance(val, list):
+                            raise TypeError("DISK_THROTTLE_PATHS must be an array")
+                        self.DISK_THROTTLE_PATHS = [str(p).strip() for p in val if str(p).strip()]
+                        logging.info("Setting DISK_THROTTLE_PATHS updated (%d paths)", len(self.DISK_THROTTLE_PATHS))
+                    except Exception as e:
+                        logging.warning("Failed to update setting DISK_THROTTLE_PATHS: %s", e)
 
     def to_dict(self):
         """Return current settings as a dictionary."""

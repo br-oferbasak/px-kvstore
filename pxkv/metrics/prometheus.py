@@ -83,4 +83,21 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
         f'pxkv_replication_queue_drops_by_policy_total{{policy="drop_oldest"}} {int(q.get("drops_drop_oldest", 0) or 0)}'
     )
 
+    disk = metrics.get("disk", {}) or {}
+    lines.append("# HELP pxkv_disk_used_bytes Used bytes on the monitored filesystem.")
+    lines.append("# TYPE pxkv_disk_used_bytes gauge")
+    lines.append(f"pxkv_disk_used_bytes {int(disk.get('used_bytes', 0) or 0)}")
+    lines.append("# HELP pxkv_disk_free_bytes Free bytes on the monitored filesystem.")
+    lines.append("# TYPE pxkv_disk_free_bytes gauge")
+    lines.append(f"pxkv_disk_free_bytes {int(disk.get('free_bytes', 0) or 0)}")
+    lines.append("# HELP pxkv_disk_used_percent Used percentage on the monitored filesystem.")
+    lines.append("# TYPE pxkv_disk_used_percent gauge")
+    lines.append(f"pxkv_disk_used_percent {float(disk.get('used_percent', 0.0) or 0.0)}")
+    lines.append("# HELP pxkv_disk_throttled_total Total number of writes delayed by disk throttling.")
+    lines.append("# TYPE pxkv_disk_throttled_total counter")
+    lines.append(f"pxkv_disk_throttled_total {int(disk.get('throttled_total', 0) or 0)}")
+    lines.append("# HELP pxkv_disk_rejected_total Total number of writes rejected by disk throttling.")
+    lines.append("# TYPE pxkv_disk_rejected_total counter")
+    lines.append(f"pxkv_disk_rejected_total {int(disk.get('rejected_total', 0) or 0)}")
+
     return "\n".join(lines) + "\n"

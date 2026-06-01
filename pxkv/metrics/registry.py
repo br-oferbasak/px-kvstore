@@ -36,6 +36,22 @@ class MetricsRegistry:
                     "last_drop_reason": "",
                 },
             },
+            "disk": {
+                "enabled": False,
+                "paths": [],
+                "last_path": "",
+                "total_bytes": 0,
+                "used_bytes": 0,
+                "free_bytes": 0,
+                "used_percent": 0.0,
+                "soft_exceeded": False,
+                "hard_exceeded": False,
+                "last_checked_at": 0.0,
+                "throttled_total": 0,
+                "rejected_total": 0,
+                "last_delay_ms": 0.0,
+                "last_reject_reason": "",
+            },
         }
 
     def inc_requests(self, method: str, error: bool = False):
@@ -147,6 +163,47 @@ class MetricsRegistry:
             q["drops_drop_newest"] = int(q.get("drops_drop_newest", 0) or 0) + 1
         q["last_drop_at"] = time.time()
         q["last_drop_reason"] = str(reason or "")
+
+    def observe_disk_usage(self, sample: Dict[str, Any]) -> None:
+        disk = self._metrics.setdefault(
+            "disk",
+            {
+                "enabled": False,
+                "paths": [],
+                "last_path": "",
+                "total_bytes": 0,
+                "used_bytes": 0,
+                "free_bytes": 0,
+                "used_percent": 0.0,
+                "soft_exceeded": False,
+                "hard_exceeded": False,
+                "last_checked_at": 0.0,
+                "throttled_total": 0,
+                "rejected_total": 0,
+                "last_delay_ms": 0.0,
+                "last_reject_reason": "",
+            },
+        )
+        disk["enabled"] = bool(sample.get("enabled", False))
+        disk["paths"] = list(sample.get("paths", []) or [])
+        disk["last_path"] = str(sample.get("last_path", "") or sample.get("path", "") or "")
+        disk["total_bytes"] = int(sample.get("total_bytes", 0) or 0)
+        disk["used_bytes"] = int(sample.get("used_bytes", 0) or 0)
+        disk["free_bytes"] = int(sample.get("free_bytes", 0) or 0)
+        disk["used_percent"] = float(sample.get("used_percent", 0.0) or 0.0)
+        disk["soft_exceeded"] = bool(sample.get("soft_exceeded", False))
+        disk["hard_exceeded"] = bool(sample.get("hard_exceeded", False))
+        disk["last_checked_at"] = float(sample.get("last_checked_at", time.time()) or time.time())
+
+    def inc_disk_throttle(self, delay_ms: float) -> None:
+        disk = self._metrics.setdefault("disk", {})
+        disk["throttled_total"] = int(disk.get("throttled_total", 0) or 0) + 1
+        disk["last_delay_ms"] = float(delay_ms or 0.0)
+
+    def inc_disk_reject(self, reason: str) -> None:
+        disk = self._metrics.setdefault("disk", {})
+        disk["rejected_total"] = int(disk.get("rejected_total", 0) or 0) + 1
+        disk["last_reject_reason"] = str(reason or "")
 
     def get_all(self) -> Dict[str, Any]:
         return self._metrics

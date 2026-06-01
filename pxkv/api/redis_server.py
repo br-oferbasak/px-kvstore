@@ -14,6 +14,7 @@ from ..metrics.registry import registry
 from ..config.settings import settings
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, role_satisfies
 from ..notifications import notifier
+from ..persistence.disk_throttle import disk_throttler
 
 def encode_simple_string(s: str) -> bytes:
     return f"+{s}\r\n".encode("utf-8")
@@ -258,6 +259,17 @@ class RedisServer(threading.Thread):
                 required = self._required_role_for_cmd(cmd)
                 if not role_satisfies(role, required):
                     return encode_error("NOPERM this user has no permissions to run the command"), role
+
+            if cmd in ("SET", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST"):
+                decision = disk_throttler.gate_write()
+                registry.observe_disk_usage(decision)
+                delay_ms = float(decision.get("delay_ms", 0.0) or 0.0)
+                if delay_ms > 0 and not decision.get("rejected", False):
+                    registry.inc_disk_throttle(delay_ms)
+                if decision.get("rejected", False):
+                    reason = str(decision.get("reason", "") or "disk usage threshold exceeded")
+                    registry.inc_disk_reject(reason)
+                    return encode_error(f"ERR disk throttled: {reason}"), role
 
             if cmd == "AUTH":
                 if len(args) not in (2, 3):
