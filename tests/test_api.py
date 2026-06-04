@@ -537,3 +537,107 @@ def test_disk_usage_throttling_blocks_writes(tmp_path):
         assert metrics["disk"]["rejected_total"] >= 1
     finally:
         stop_proc(proc)
+
+
+def test_namespace_isolation_auth_and_rate_limits():
+    port = get_free_port()
+    env = os.environ.copy()
+    env["PXKV_PORT"] = str(port)
+    env["PXKV_REDIS_ENABLED"] = "false"
+    env["PXKV_FAULT_LATENCY_MS"] = "0"
+    env["PXKV_FAULT_LATENCY_JITTER_MS"] = "0"
+    env["PXKV_NAMESPACE_ENABLED"] = "true"
+    env["PXKV_NAMESPACE_DEFAULT"] = "tenant-a"
+    env["PXKV_NAMESPACE_CONFIGS"] = json.dumps(
+        {
+            "tenant-a": {
+                "auth": {"writer_token": "wa", "reader_token": "ra"},
+                "rate_limit_routes": {"GET /kv/:key": {"rps": 0.1, "burst": 1, "per_ip": False}},
+            },
+            "tenant-b": {
+                "auth": {"writer_token": "wb", "reader_token": "rb"},
+            },
+        }
+    )
+
+    proc = subprocess.Popen(["python3", "server.py"], env=env)
+    base = f"http://localhost:{port}"
+    try:
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{base}/admin/health", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.2)
+
+        req_a = urllib.request.Request(
+            f"{base}/kv/shared",
+            data=json.dumps({"tenant": "a"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer wa", "X-PXKV-Namespace": "tenant-a"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_a, timeout=2.0) as resp:
+            assert resp.status in (201, 204)
+            assert resp.headers.get("X-PXKV-Namespace") == "tenant-a"
+
+        req_b = urllib.request.Request(
+            f"{base}/kv/shared",
+            data=json.dumps({"tenant": "b"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer wb", "X-PXKV-Namespace": "tenant-b"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req_b, timeout=2.0) as resp:
+            assert resp.status in (201, 204)
+            assert resp.headers.get("X-PXKV-Namespace") == "tenant-b"
+
+        get_a = urllib.request.Request(
+            f"{base}/kv/shared",
+            headers={"Authorization": "Bearer ra", "X-PXKV-Namespace": "tenant-a"},
+        )
+        with urllib.request.urlopen(get_a, timeout=2.0) as resp:
+            assert resp.status == 200
+            body_a = json.loads(resp.read().decode("utf-8"))
+        assert body_a["value"] == {"tenant": "a"}
+
+        get_b = urllib.request.Request(
+            f"{base}/kv/shared",
+            headers={"Authorization": "Bearer rb", "X-PXKV-Namespace": "tenant-b"},
+        )
+        with urllib.request.urlopen(get_b, timeout=2.0) as resp:
+            assert resp.status == 200
+            body_b = json.loads(resp.read().decode("utf-8"))
+        assert body_b["value"] == {"tenant": "b"}
+
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{base}/kv/shared",
+                    headers={"Authorization": "Bearer ra", "X-PXKV-Namespace": "tenant-b"},
+                ),
+                timeout=2.0,
+            )
+            raise AssertionError("expected auth failure")
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+
+        scan_req = urllib.request.Request(
+            f"{base}/kv/scan?prefix=sh",
+            headers={"Authorization": "Bearer rb", "X-PXKV-Namespace": "tenant-b"},
+        )
+        with urllib.request.urlopen(scan_req, timeout=2.0) as resp:
+            assert resp.status == 200
+            scan_body = json.loads(resp.read().decode("utf-8"))
+        assert scan_body["keys"] == ["shared"]
+
+        try:
+            urllib.request.urlopen(get_a, timeout=2.0)
+            raise AssertionError("expected namespace rate limit")
+        except urllib.error.HTTPError as e:
+            assert e.code == 429
+
+        with urllib.request.urlopen(get_b, timeout=2.0) as resp:
+            assert resp.status == 200
+    finally:
+        stop_proc(proc)

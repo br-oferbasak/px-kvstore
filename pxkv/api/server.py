@@ -33,6 +33,7 @@ from ..api.redis_server import RedisServer
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, parse_basic_password, parse_bearer, role_satisfies
 from ..notifications import notifier
 from .. import tracing
+from ..namespaces import NAMESPACE_HEADER, namespace_manager
 from ..persistence.disk_throttle import disk_throttler
 from ..persistence.gossip import initialize_gossip, get_gossip_membership
 
@@ -169,10 +170,11 @@ class _RateLimiter:
             route_policies=getattr(settings, "RATE_LIMIT_ROUTES", None) or {},
         )
 
-    def _policy_for(self, route: str) -> tuple[float, int, bool] | None:
-        pol = (self._route_policies or {}).get(route)
+    def _policy_for(self, route: str, default_policy: Optional[dict] = None, route_policies: Optional[dict] = None) -> tuple[float, int, bool] | None:
+        policies = route_policies if isinstance(route_policies, dict) else self._route_policies
+        pol = (policies or {}).get(route)
         if not isinstance(pol, dict):
-            pol = self._default_policy or {}
+            pol = default_policy if isinstance(default_policy, dict) else self._default_policy or {}
 
         try:
             rps = float(pol.get("rps", 0.0) or 0.0)
@@ -185,16 +187,26 @@ class _RateLimiter:
             return None
         return rps, burst, per_ip
 
-    def allow(self, route: str, client_ip: str) -> tuple[bool, int]:
+    def allow(
+        self,
+        route: str,
+        client_ip: str,
+        *,
+        enabled: Optional[bool] = None,
+        scope: str = "",
+        default_policy: Optional[dict] = None,
+        route_policies: Optional[dict] = None,
+    ) -> tuple[bool, int]:
         with self._lock:
-            if not self._enabled:
+            if not (self._enabled if enabled is None else bool(enabled)):
                 return True, 0
-            policy = self._policy_for(route)
+            policy = self._policy_for(route, default_policy=default_policy, route_policies=route_policies)
             if policy is None:
                 return True, 0
             rps, burst, per_ip = policy
             dim = client_ip if per_ip else "*"
-            key = f"{route}|{dim}"
+            prefix = f"{scope}|" if scope else ""
+            key = f"{prefix}{route}|{dim}"
             bucket = self._buckets.get(key)
             if bucket is None:
                 bucket = _TokenBucket(rps, burst)
@@ -258,6 +270,43 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     server_version = "PX-KVStore/2.0"
     protocol_version = "HTTP/1.1"
 
+    def _namespace_from_query(self, query: Optional[Dict[str, list[str]]] = None) -> Optional[str]:
+        if query is None:
+            _, query = self._parse()
+        explicit = None
+        if "namespace" in query and query["namespace"]:
+            explicit = query["namespace"][0]
+        elif "ns" in query and query["ns"]:
+            explicit = query["ns"][0]
+        else:
+            explicit = self.headers.get(NAMESPACE_HEADER, "") or ""
+        return namespace_manager.resolve(explicit)
+
+    def _namespace_or_400(self, query: Optional[Dict[str, list[str]]] = None) -> Optional[str]:
+        namespace = self._namespace_from_query(query)
+        if namespace is not None:
+            return namespace
+        self._send(400, "Invalid namespace")
+        return None
+
+    def _with_namespace_headers(self, headers: Optional[Dict[str, str]], namespace: Optional[str]) -> Dict[str, str]:
+        out = dict(headers or {})
+        if namespace is not None:
+            out[NAMESPACE_HEADER] = namespace
+        return out
+
+    def _ns_key(self, namespace: Optional[str], key: Any) -> Any:
+        ns = namespace_manager.resolve(namespace)
+        return namespace_manager.key(ns or namespace_manager.default(), key)
+
+    def _ns_strip(self, namespace: Optional[str], key: Any) -> Any:
+        ns = namespace_manager.resolve(namespace)
+        return namespace_manager.strip(ns or namespace_manager.default(), key)
+
+    def _ns_prefix(self, namespace: Optional[str], prefix: Optional[str]) -> Optional[str]:
+        ns = namespace_manager.resolve(namespace)
+        return namespace_manager.user_prefix(ns or namespace_manager.default(), prefix)
+
     def _client_ip(self) -> str:
         xff = self.headers.get("X-Forwarded-For", "") or ""
         if xff.strip():
@@ -267,16 +316,30 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except Exception:
             return ""
 
-    def _rate_limit(self, route: str) -> bool:
+    def _rate_limit(self, route: str, namespace: Optional[str] = None) -> bool:
         if route in ("GET /admin/config", "POST /admin/config", "POST /admin/config/reload"):
             return True
-        ok, retry_after_s = _RATE_LIMITER.allow(route, self._client_ip())
+        ns = namespace_manager.resolve(namespace)
+        if ns is None:
+            self._send(400, "Invalid namespace")
+            self._inc_metrics(self.command or "GET", route=route, error=True)
+            return False
+        ns_cfg = namespace_manager.config(ns)
+        ns_rate_enabled = "rate_limit_default" in ns_cfg or "rate_limit_routes" in ns_cfg
+        ok, retry_after_s = _RATE_LIMITER.allow(
+            route,
+            self._client_ip(),
+            enabled=bool(getattr(settings, "RATE_LIMIT_ENABLED", False) or ns_rate_enabled),
+            scope=namespace_manager.scope(ns),
+            default_policy=namespace_manager.rate_limit_default(ns),
+            route_policies=namespace_manager.rate_limit_routes(ns),
+        )
         if ok:
             return True
         self._json(
             429,
-            {"error": "rate_limited", "route": route, "retry_after_seconds": retry_after_s},
-            headers={"Retry-After": str(retry_after_s)},
+            {"error": "rate_limited", "route": route, "retry_after_seconds": retry_after_s, "namespace": ns},
+            headers={"Retry-After": str(retry_after_s), NAMESPACE_HEADER: ns},
         )
         self._inc_metrics(self.command or "GET", route=route, error=True)
         return False
@@ -384,61 +447,37 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self._inc_metrics(self.command or "WRITE", route=route, error=True)
         return False
 
-    def _auth_enabled(self) -> bool:
-        return any(
-            [
-                settings.AUTH_ADMIN_TOKEN,
-                settings.AUTH_WRITER_TOKEN,
-                settings.AUTH_READER_TOKEN,
-                settings.AUTH_ADMIN_PASSWORD,
-                settings.AUTH_WRITER_PASSWORD,
-                settings.AUTH_READER_PASSWORD,
-            ]
-        )
+    def _auth_enabled(self, namespace: Optional[str] = None) -> bool:
+        return namespace_manager.auth_enabled(namespace)
 
-    def _auth_role(self) -> Optional[str]:
+    def _auth_role(self, namespace: Optional[str] = None) -> Optional[str]:
         authorization = self.headers.get("Authorization", "") or ""
         token = parse_bearer(authorization) or (self.headers.get("X-Auth-Token", "") or "")
         password = parse_basic_password(authorization) or (self.headers.get("X-Auth-Password", "") or "")
 
         if token:
-            role = best_role_for_secret(
-                token,
-                admin_token=settings.AUTH_ADMIN_TOKEN,
-                writer_token=settings.AUTH_WRITER_TOKEN,
-                reader_token=settings.AUTH_READER_TOKEN,
-                admin_password=settings.AUTH_ADMIN_PASSWORD,
-                writer_password=settings.AUTH_WRITER_PASSWORD,
-                reader_password=settings.AUTH_READER_PASSWORD,
-            )
+            role = namespace_manager.role_for_secret(namespace, token)
             if role:
                 return role
 
         if password:
-            role = best_role_for_secret(
-                password,
-                admin_token=settings.AUTH_ADMIN_TOKEN,
-                writer_token=settings.AUTH_WRITER_TOKEN,
-                reader_token=settings.AUTH_READER_TOKEN,
-                admin_password=settings.AUTH_ADMIN_PASSWORD,
-                writer_password=settings.AUTH_WRITER_PASSWORD,
-                reader_password=settings.AUTH_READER_PASSWORD,
-            )
+            role = namespace_manager.role_for_secret(namespace, password)
             if role:
                 return role
 
         return None
 
-    def _require_role(self, required: str) -> bool:
-        if not self._auth_enabled():
+    def _require_role(self, required: str, namespace: Optional[str] = None) -> bool:
+        if not self._auth_enabled(namespace):
             return True
-        role = self._auth_role()
+        role = self._auth_role(namespace)
         if role is None:
             self._send(
                 401,
                 "Unauthorized",
                 headers={
                     "WWW-Authenticate": 'Bearer realm="pxkv", charset="UTF-8"',
+                    **self._with_namespace_headers({}, namespace_manager.resolve(namespace)),
                 },
             )
             self._inc_metrics("AUTH", route="AUTH (missing)", error=True)
@@ -488,7 +527,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _forward_auth_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {}
-        for k in ("Authorization", "X-Auth-Token", "X-Auth-Password"):
+        for k in ("Authorization", "X-Auth-Token", "X-Auth-Password", NAMESPACE_HEADER):
             v = self.headers.get(k)
             if v:
                 headers[k] = v
@@ -700,23 +739,36 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts == ["events", "keyspace"]:
-                if not self._rate_limit("GET /events/keyspace"):
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("GET", route="GET /events/keyspace", error=True)
                     return
-                if not self._require_role(ROLE_READER):
+                if not self._rate_limit("GET /events/keyspace", namespace=namespace):
+                    return
+                if not self._require_role(ROLE_READER, namespace=namespace):
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                self.send_header(NAMESPACE_HEADER, namespace)
                 self.end_headers()
                 sid, q = notifier.subscribe()
                 try:
                     while True:
                         try:
                             ev = q.get(timeout=15.0)
-                            payload = ev.to_json()
+                            if not namespace_manager.belongs(namespace, ev.key):
+                                continue
+                            payload = {
+                                "op": ev.op,
+                                "key": self._ns_strip(namespace, ev.key),
+                                "lsn": ev.lsn,
+                                "shard": ev.shard,
+                                "ts": ev.ts,
+                            }
                             self.wfile.write(b"event: keyspace\n")
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                            self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8"))
                             try:
                                 self.wfile.flush()
                             except Exception:
@@ -805,17 +857,22 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             if parts[0] == "ai":
-                if not self._rate_limit("GET /ai/cache/:key"):
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("GET", route="GET /ai/cache/:key", error=True)
                     return
-                if not self._require_role(ROLE_READER):
+                if not self._rate_limit("GET /ai/cache/:key", namespace=namespace):
+                    return
+                if not self._require_role(ROLE_READER, namespace=namespace):
                     return
                 if len(parts) >= 2 and parts[1] == "cache":
                     if len(parts) != 3 or not parts[2]:
                         raise ValueError
                     cache_key = parts[2]
-                    storage_key = f"ai:cache:{cache_key}"
+                    storage_key = self._ns_key(namespace, f"ai:cache:{cache_key}")
                     value = STORE.read(storage_key)
-                    self._json(200, {"key": cache_key, "value": value}, headers=self._staleness_headers())
+                    headers = self._with_namespace_headers(self._staleness_headers(), namespace)
+                    self._json(200, {"key": cache_key, "value": value}, headers=headers)
                     self._inc_metrics("GET", route="GET /ai/cache/:key")
                     return
                 raise ValueError
@@ -823,21 +880,26 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if parts[0] != "kv":
                 raise ValueError
 
+            namespace = self._namespace_or_400(query)
+            if namespace is None:
+                self._inc_metrics("GET", route="GET /kv (invalid_namespace)", error=True)
+                return
+
             if len(parts) >= 2 and parts[1] == "batch":
-                if not self._rate_limit("GET /kv/batch"):
+                if not self._rate_limit("GET /kv/batch", namespace=namespace):
                     return
             elif len(parts) >= 2 and parts[1] == "scan":
-                if not self._rate_limit("GET /kv/scan"):
+                if not self._rate_limit("GET /kv/scan", namespace=namespace):
                     return
             else:
-                if not self._rate_limit("GET /kv/:key"):
+                if not self._rate_limit("GET /kv/:key", namespace=namespace):
                     return
 
             if parts and parts[0] == "kv":
                 if self._maybe_route_read_to_follower(parts, query):
                     return
 
-            if not self._require_role(ROLE_READER):
+            if not self._require_role(ROLE_READER, namespace=namespace):
                 return
             if len(parts) >= 2 and parts[1] == "batch":
                 if "keys" not in query:
@@ -845,12 +907,18 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._inc_metrics("GET", route="GET /kv/batch", error=True)
                     return
                 keys = query["keys"][0].split(",")
+                prefixed = [self._ns_key(namespace, k) for k in keys]
+                raw_items = STORE.mget(prefixed)
+                scoped_items = {
+                    str(self._ns_strip(namespace, stored_key)): value
+                    for stored_key, value in raw_items.items()
+                }
                 extra = getattr(self, "_fallback_headers", None)
-                headers = self._staleness_headers()
+                headers = self._with_namespace_headers(self._staleness_headers(), namespace)
                 if isinstance(extra, dict):
                     headers = {**headers, **extra}
                     self._fallback_headers = None
-                self._json(200, STORE.mget(keys), headers=headers)
+                self._json(200, scoped_items, headers=headers)
                 self._inc_metrics("GET", route="GET /kv/batch")
                 return
 
@@ -869,9 +937,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._send(400, "limit must be int")
                         self._inc_metrics("GET", route="GET /kv/scan", error=True)
                         return
-                keys = STORE.scan(prefix=prefix, limit=limit, start_after=start_after)
+                keys = STORE.scan(
+                    prefix=self._ns_prefix(namespace, prefix),
+                    limit=limit,
+                    start_after=self._ns_key(namespace, start_after) if start_after else None,
+                )
+                keys = [str(self._ns_strip(namespace, key)) for key in keys]
                 extra = getattr(self, "_fallback_headers", None)
-                headers = self._staleness_headers()
+                headers = self._with_namespace_headers(self._staleness_headers(), namespace)
                 if isinstance(extra, dict):
                     headers = {**headers, **extra}
                     self._fallback_headers = None
@@ -894,9 +967,14 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._send(400, "limit must be int")
                         self._inc_metrics("GET", route="GET /kv/scan-cursor", error=True)
                         return
-                next_cursor, keys = STORE.scan_with_cursor(cursor=cursor, prefix=prefix, limit=limit)
+                next_cursor, keys = STORE.scan_with_cursor(
+                    cursor=cursor,
+                    prefix=self._ns_prefix(namespace, prefix),
+                    limit=limit,
+                )
+                keys = [str(self._ns_strip(namespace, key)) for key in keys]
                 extra = getattr(self, "_fallback_headers", None)
-                headers = self._staleness_headers()
+                headers = self._with_namespace_headers(self._staleness_headers(), namespace)
                 if isinstance(extra, dict):
                     headers = {**headers, **extra}
                     self._fallback_headers = None
@@ -908,12 +986,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 raise ValueError
 
             key = parts[1]
-            value, etag = STORE.read_with_etag(key)
+            storage_key = self._ns_key(namespace, key)
+            value, etag = STORE.read_with_etag(storage_key)
             
             if_none_match = self.headers.get("If-None-Match", "")
             if if_none_match == etag or (if_none_match == "*"):
                 extra = getattr(self, "_fallback_headers", None)
-                headers = self._staleness_headers()
+                headers = self._with_namespace_headers(self._staleness_headers(), namespace)
                 if isinstance(extra, dict):
                     headers = {**headers, **extra}
                     self._fallback_headers = None
@@ -923,7 +1002,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
 
             extra = getattr(self, "_fallback_headers", None)
-            headers = self._staleness_headers()
+            headers = self._with_namespace_headers(self._staleness_headers(), namespace)
             if isinstance(extra, dict):
                 headers = {**headers, **extra}
                 self._fallback_headers = None
@@ -932,7 +1011,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._inc_metrics("GET", route="GET /kv/:key")
         except KeyError as e:
             extra = getattr(self, "_fallback_headers", None)
-            headers = self._staleness_headers()
+            namespace = self._namespace_from_query(query)
+            headers = self._with_namespace_headers(self._staleness_headers(), namespace)
             if isinstance(extra, dict):
                 headers = {**headers, **extra}
                 self._fallback_headers = None
@@ -943,7 +1023,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("GET", route="GET /kv/:key", error=True)
         except ValueError:
             extra = getattr(self, "_fallback_headers", None)
-            headers = self._staleness_headers()
+            namespace = self._namespace_from_query(query)
+            headers = self._with_namespace_headers(self._staleness_headers(), namespace)
             if isinstance(extra, dict):
                 headers = {**headers, **extra}
                 self._fallback_headers = None
@@ -960,19 +1041,24 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _do_PUT_inner(self) -> None:
         try:
-            if not self._rate_limit("PUT /kv/:key"):
+            parts, query = self._parse()
+            namespace = self._namespace_or_400(query)
+            if namespace is None:
+                self._inc_metrics("PUT", route="PUT /kv/:key", error=True)
                 return
-            if not self._require_role(ROLE_WRITER):
+            if not self._rate_limit("PUT /kv/:key", namespace=namespace):
+                return
+            if not self._require_role(ROLE_WRITER, namespace=namespace):
                 return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="PUT /kv/:key")
                 return
             if not self._enforce_disk_write_budget("PUT /kv/:key"):
                 return
-            parts, query = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
             key = parts[1]
+            storage_key = self._ns_key(namespace, key)
             ttl = float(query["ttl"][0]) if "ttl" in query else None
 
             raw = self._body()
@@ -981,12 +1067,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             except ValueError:
                 value = raw
 
-            if key in STORE.mget([key]):
-                STORE.update(key, value, ttl)
-                self._send(204)
+            if storage_key in STORE.mget([storage_key]):
+                STORE.update(storage_key, value, ttl)
+                self._send(204, headers=self._with_namespace_headers({}, namespace))
             else:
-                STORE.create(key, value, ttl)
-                self._send(201)
+                STORE.create(storage_key, value, ttl)
+                self._send(201, headers=self._with_namespace_headers({}, namespace))
             self._inc_metrics("PUT", route="PUT /kv/:key")
         except KeyError as e:
             self._send(409, str(e))
@@ -1005,18 +1091,22 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _do_DELETE_inner(self) -> None:
         try:
-            if not self._rate_limit("DELETE /kv/:key"):
+            parts, query = self._parse()
+            namespace = self._namespace_or_400(query)
+            if namespace is None:
+                self._inc_metrics("DELETE", route="DELETE /kv/:key", error=True)
                 return
-            if not self._require_role(ROLE_WRITER):
+            if not self._rate_limit("DELETE /kv/:key", namespace=namespace):
+                return
+            if not self._require_role(ROLE_WRITER, namespace=namespace):
                 return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="DELETE /kv/:key")
                 return
-            parts, _ = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
-            STORE.delete(parts[1])
-            self._send(204)
+            STORE.delete(self._ns_key(namespace, parts[1]))
+            self._send(204, headers=self._with_namespace_headers({}, namespace))
             self._inc_metrics("DELETE", route="DELETE /kv/:key")
         except KeyError as e:
             self._send(404, str(e))
@@ -1035,19 +1125,24 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _do_PATCH_inner(self) -> None:
         try:
-            if not self._rate_limit("PATCH /kv/:key"):
+            parts, query = self._parse()
+            namespace = self._namespace_or_400(query)
+            if namespace is None:
+                self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
                 return
-            if not self._require_role(ROLE_WRITER):
+            if not self._rate_limit("PATCH /kv/:key", namespace=namespace):
+                return
+            if not self._require_role(ROLE_WRITER, namespace=namespace):
                 return
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="PATCH /kv/:key")
                 return
             if not self._enforce_disk_write_budget("PATCH /kv/:key"):
                 return
-            parts, query = self._parse()
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
             key = parts[1]
+            storage_key = self._ns_key(namespace, key)
             ttl = float(query["ttl"][0]) if "ttl" in query else None
             raw = self._body()
             try:
@@ -1060,8 +1155,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send(400, "JSON Patch payload must be an array of operations")
                 self._inc_metrics("PATCH", route="PATCH /kv/:key", error=True)
                 return
-            new_value, etag = STORE.patch(key, patches, ttl)
-            headers = self._staleness_headers()
+            new_value, etag = STORE.patch(storage_key, patches, ttl)
+            headers = self._with_namespace_headers(self._staleness_headers(), namespace)
             headers["ETag"] = etag
             self._json(200, {"key": key, "value": new_value}, headers=headers)
             self._inc_metrics("PATCH", route="PATCH /kv/:key")
@@ -1085,7 +1180,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def _do_POST_inner(self) -> None:
         try:
-            parts, _ = self._parse()
+            parts, query = self._parse()
             
             if parts == ["replication", "sync"]:
                 if not self._rate_limit("POST /replication/sync"):
@@ -1167,9 +1262,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
             if len(parts) >= 1 and parts[0] == "ai":
                 if parts == ["ai", "cache", "lookup"]:
-                    if not self._rate_limit("POST /ai/cache/lookup"):
+                    namespace = self._namespace_or_400(query)
+                    if namespace is None:
+                        self._inc_metrics("POST", route="POST /ai/cache/lookup", error=True)
                         return
-                    if not self._require_role(ROLE_READER):
+                    if not self._rate_limit("POST /ai/cache/lookup", namespace=namespace):
+                        return
+                    if not self._require_role(ROLE_READER, namespace=namespace):
                         return
                     payload = json.loads(self._body() or b"{}")
                     prompt = payload.get("prompt", "")
@@ -1181,25 +1280,29 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._inc_metrics("POST", route="POST /ai/cache/lookup", error=True)
                         return
                     key, canon = ai_cache_manager.compute_key(prompt, model, params, model_version=model_version)
-                    storage_key = f"ai:cache:{key}"
+                    storage_key = self._ns_key(namespace, f"ai:cache:{key}")
                     registry.inc_ai_cache("lookups")
                     try:
                         cached = STORE.read(storage_key)
                         cached = ai_cache_manager.decompress_value(cached)
                     except KeyError:
                         registry.inc_ai_cache("misses")
-                        self._json(200, {"hit": False, "key": key, "canonical": canon})
+                        self._json(200, {"hit": False, "key": key, "canonical": canon}, headers=self._with_namespace_headers({}, namespace))
                         self._inc_metrics("POST", route="POST /ai/cache/lookup")
                         return
                     registry.inc_ai_cache("hits")
-                    self._json(200, {"hit": True, "key": key, "canonical": canon, "value": cached})
+                    self._json(200, {"hit": True, "key": key, "canonical": canon, "value": cached}, headers=self._with_namespace_headers({}, namespace))
                     self._inc_metrics("POST", route="POST /ai/cache/lookup")
                     return
 
                 if parts == ["ai", "cache"]:
-                    if not self._rate_limit("POST /ai/cache"):
+                    namespace = self._namespace_or_400(query)
+                    if namespace is None:
+                        self._inc_metrics("POST", route="POST /ai/cache", error=True)
                         return
-                    if not self._require_role(ROLE_WRITER):
+                    if not self._rate_limit("POST /ai/cache", namespace=namespace):
+                        return
+                    if not self._require_role(ROLE_WRITER, namespace=namespace):
                         return
                     if settings.REPLICATION_ROLE == "follower":
                         self._reject_readonly(route="POST /ai/cache")
@@ -1227,7 +1330,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                             self._inc_metrics("POST", route="POST /ai/cache", error=True)
                             return
                     key, canon = ai_cache_manager.compute_key(prompt, model, params, model_version=model_version)
-                    storage_key = f"ai:cache:{key}"
+                    storage_key = self._ns_key(namespace, f"ai:cache:{key}")
                     if compress:
                         value = ai_cache_manager.compress_value(value)
                     if storage_key in STORE.mget([storage_key]):
@@ -1235,14 +1338,18 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     else:
                         STORE.create(storage_key, value, ttl_f)
                     registry.inc_ai_cache("stores")
-                    self._json(201, {"key": key, "canonical": canon})
+                    self._json(201, {"key": key, "canonical": canon}, headers=self._with_namespace_headers({}, namespace))
                     self._inc_metrics("POST", route="POST /ai/cache")
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":
-                if not self._rate_limit("POST /kv/incr/:key"):
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("POST", route="POST /kv/incr/:key", error=True)
                     return
-                if not self._require_role(ROLE_WRITER):
+                if not self._rate_limit("POST /kv/incr/:key", namespace=namespace):
+                    return
+                if not self._require_role(ROLE_WRITER, namespace=namespace):
                     return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/incr/:key")
@@ -1250,9 +1357,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if not self._enforce_disk_write_budget("POST /kv/incr/:key"):
                     return
                 key = parts[2]
+                storage_key = self._ns_key(namespace, key)
                 delta = 1.0
                 ttl = None
-                _, query = self._parse()
                 if "delta" in query:
                     try:
                         delta = float(query["delta"][0])
@@ -1268,18 +1375,22 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._inc_metrics("POST", route="POST /kv/incr/:key", error=True)
                         return
                 try:
-                    new_val = STORE.incr(key, delta=delta, ttl=ttl)
+                    new_val = STORE.incr(storage_key, delta=delta, ttl=ttl)
                 except TypeError as e:
                     self._send(400, str(e))
                     self._inc_metrics("POST", route="POST /kv/incr/:key", error=True)
                     return
-                self._json(200, {"key": key, "value": new_val})
+                self._json(200, {"key": key, "value": new_val}, headers=self._with_namespace_headers({}, namespace))
                 self._inc_metrics("POST", route="POST /kv/incr/:key")
                 return
             if parts == ["kv", "batch"]:
-                if not self._rate_limit("POST /kv/batch"):
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("POST", route="POST /kv/batch", error=True)
                     return
-                if not self._require_role(ROLE_WRITER):
+                if not self._rate_limit("POST /kv/batch", namespace=namespace):
+                    return
+                if not self._require_role(ROLE_WRITER, namespace=namespace):
                     return
                 if settings.REPLICATION_ROLE == "follower":
                     self._reject_readonly(route="POST /kv/batch")
@@ -1293,8 +1404,9 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self._send(400, "items must be dict")
                     self._inc_metrics("POST", route="POST /kv/batch", error=True)
                     return
-                STORE.mset(items, ttl)
-                self._send(201)
+                scoped_items = {self._ns_key(namespace, k): v for k, v in items.items()}
+                STORE.mset(scoped_items, ttl)
+                self._send(201, headers=self._with_namespace_headers({}, namespace))
                 self._inc_metrics("POST", route="POST /kv/batch")
                 return
 

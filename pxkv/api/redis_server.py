@@ -13,6 +13,7 @@ from typing import Any, List, Optional
 from ..metrics.registry import registry
 from ..config.settings import settings
 from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, role_satisfies
+from ..namespaces import namespace_manager
 from ..notifications import notifier
 from ..persistence.disk_throttle import disk_throttler
 
@@ -100,6 +101,7 @@ class RedisServer(threading.Thread):
         conn.settimeout(0.2)
         f = conn.makefile("rb")
         role: Optional[str] = None
+        namespace = namespace_manager.default()
         sub_sid: Optional[int] = None
         sub_q = None
         subs: set[str] = set()
@@ -111,7 +113,18 @@ class RedisServer(threading.Thread):
                             ev = sub_q.get_nowait()
                         except Empty:
                             break
-                        payload = ev.to_json()
+                        if not namespace_manager.belongs(namespace, ev.key):
+                            continue
+                        payload = json.dumps(
+                            {
+                                "op": ev.op,
+                                "key": namespace_manager.strip(namespace, ev.key),
+                                "lsn": ev.lsn,
+                                "shard": ev.shard,
+                                "ts": ev.ts,
+                            },
+                            ensure_ascii=False,
+                        )
                         op = str(ev.op)
                         for ch in list(subs):
                             if ch == "pxkv:keyspace" or ch == f"pxkv:keyspace:{op}":
@@ -143,7 +156,7 @@ class RedisServer(threading.Thread):
 
                 cmd = args[0].decode("utf-8", errors="replace").upper()
                 if cmd in ("SUBSCRIBE", "UNSUBSCRIBE"):
-                    if self._auth_enabled():
+                    if self._auth_enabled(namespace):
                         if role is None:
                             conn.sendall(encode_error("NOAUTH Authentication required."))
                             continue
@@ -192,7 +205,7 @@ class RedisServer(threading.Thread):
                     conn.sendall(encode_error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING are allowed in this context"))
                     continue
 
-                response, role = self.handle_command(args, role)
+                response, role, namespace = self.handle_command(args, role, namespace)
                 conn.sendall(response)
         except Exception as e:
             logging.debug("Redis client error: %s", e)
@@ -202,28 +215,11 @@ class RedisServer(threading.Thread):
             conn.close()
             logging.info("Redis client disconnected from %s", addr)
 
-    def _auth_enabled(self) -> bool:
-        return any(
-            [
-                settings.AUTH_ADMIN_TOKEN,
-                settings.AUTH_WRITER_TOKEN,
-                settings.AUTH_READER_TOKEN,
-                settings.AUTH_ADMIN_PASSWORD,
-                settings.AUTH_WRITER_PASSWORD,
-                settings.AUTH_READER_PASSWORD,
-            ]
-        )
+    def _auth_enabled(self, namespace: Optional[str]) -> bool:
+        return namespace_manager.auth_enabled(namespace)
 
-    def _role_for_secret(self, secret: str) -> Optional[str]:
-        return best_role_for_secret(
-            secret,
-            admin_token=settings.AUTH_ADMIN_TOKEN,
-            writer_token=settings.AUTH_WRITER_TOKEN,
-            reader_token=settings.AUTH_READER_TOKEN,
-            admin_password=settings.AUTH_ADMIN_PASSWORD,
-            writer_password=settings.AUTH_WRITER_PASSWORD,
-            reader_password=settings.AUTH_READER_PASSWORD,
-        )
+    def _role_for_secret(self, secret: str, namespace: Optional[str]) -> Optional[str]:
+        return namespace_manager.role_for_secret(namespace, secret)
 
     def _required_role_for_cmd(self, cmd: str) -> str:
         if cmd in ("PING", "GET", "EXISTS", "INFO", "DBSIZE", "TTL", "PTTL", "SUBSCRIBE", "UNSUBSCRIBE"):
@@ -234,10 +230,16 @@ class RedisServer(threading.Thread):
             return ROLE_READER
         return ROLE_ADMIN
 
-    def handle_command(self, args: List[bytes], role: Optional[str]) -> tuple[bytes, Optional[str]]:
+    def handle_command(
+        self,
+        args: List[bytes],
+        role: Optional[str],
+        namespace: Optional[str],
+    ) -> tuple[bytes, Optional[str], Optional[str]]:
         cmd = args[0].decode("utf-8").upper()
         start_time = time.time()
         registry.inc_requests(f"REDIS_{cmd}")
+        namespace = namespace_manager.resolve(namespace) or namespace_manager.default()
         
         try:
             if settings.REPLICATION_ROLE == "follower" and cmd in (
@@ -251,14 +253,14 @@ class RedisServer(threading.Thread):
                 "PERSIST",
                 "FLUSHALL",
             ):
-                return encode_error("READONLY You can't write against a read-only follower."), role
+                return encode_error("READONLY You can't write against a read-only follower."), role, namespace
 
-            if self._auth_enabled() and cmd != "AUTH":
+            if self._auth_enabled(namespace) and cmd not in ("AUTH", "NAMESPACE"):
                 if role is None:
-                    return encode_error("NOAUTH Authentication required."), role
+                    return encode_error("NOAUTH Authentication required."), role, namespace
                 required = self._required_role_for_cmd(cmd)
                 if not role_satisfies(role, required):
-                    return encode_error("NOPERM this user has no permissions to run the command"), role
+                    return encode_error("NOPERM this user has no permissions to run the command"), role, namespace
 
             if cmd in ("SET", "INCR", "INCRBY", "DECR", "DECRBY", "EXPIRE", "PERSIST"):
                 decision = disk_throttler.gate_write()
@@ -269,24 +271,34 @@ class RedisServer(threading.Thread):
                 if decision.get("rejected", False):
                     reason = str(decision.get("reason", "") or "disk usage threshold exceeded")
                     registry.inc_disk_reject(reason)
-                    return encode_error(f"ERR disk throttled: {reason}"), role
+                    return encode_error(f"ERR disk throttled: {reason}"), role, namespace
+
+            if cmd == "NAMESPACE":
+                if len(args) == 1:
+                    return encode_bulk_string(namespace), role, namespace
+                if len(args) != 2:
+                    return encode_error("ERR wrong number of arguments for 'NAMESPACE' command"), role, namespace
+                candidate = namespace_manager.resolve(args[1].decode("utf-8", errors="replace"))
+                if candidate is None:
+                    return encode_error("ERR invalid namespace"), role, namespace
+                return encode_simple_string(candidate), None, candidate
 
             if cmd == "AUTH":
                 if len(args) not in (2, 3):
-                    return encode_error("ERR wrong number of arguments for 'AUTH' command"), role
+                    return encode_error("ERR wrong number of arguments for 'AUTH' command"), role, namespace
                 secret = args[-1].decode("utf-8", errors="replace")
-                new_role = self._role_for_secret(secret) if self._auth_enabled() else ROLE_ADMIN
+                new_role = self._role_for_secret(secret, namespace) if self._auth_enabled(namespace) else ROLE_ADMIN
                 if new_role is None:
-                    return encode_error("ERR invalid password"), role
-                return encode_simple_string("OK"), new_role
+                    return encode_error("ERR invalid password"), role, namespace
+                return encode_simple_string("OK"), new_role, namespace
 
             if cmd == "PING":
-                return encode_simple_string("PONG"), role
+                return encode_simple_string("PONG"), role, namespace
             
             elif cmd == "SET":
                 if len(args) < 3:
-                    return encode_error("ERR wrong number of arguments for 'SET' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error("ERR wrong number of arguments for 'SET' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 val = args[2].decode("utf-8")
                 ttl = None
                 i = 3
@@ -306,122 +318,129 @@ class RedisServer(threading.Thread):
                     self.store.update(key, val, ttl)
                 except KeyError:
                     self.store.create(key, val, ttl)
-                return encode_simple_string("OK"), role
+                return encode_simple_string("OK"), role, namespace
             
             elif cmd == "GET":
                 if len(args) != 2:
-                    return encode_error("ERR wrong number of arguments for 'GET' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error("ERR wrong number of arguments for 'GET' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 try:
                     val = self.store.read(key)
-                    return encode_bulk_string(val), role
+                    return encode_bulk_string(val), role, namespace
                 except KeyError:
-                    return encode_bulk_string(None), role
+                    return encode_bulk_string(None), role, namespace
             
             elif cmd == "DEL":
                 if len(args) < 2:
-                    return encode_error("ERR wrong number of arguments for 'DEL' command"), role
+                    return encode_error("ERR wrong number of arguments for 'DEL' command"), role, namespace
                 count = 0
                 for i in range(1, len(args)):
-                    key = args[i].decode("utf-8")
+                    key = namespace_manager.key(namespace, args[i].decode("utf-8"))
                     try:
                         self.store.delete(key)
                         count += 1
                     except KeyError:
                         pass
-                return encode_integer(count), role
+                return encode_integer(count), role, namespace
             
             elif cmd == "EXISTS":
                 if len(args) < 2:
-                    return encode_error("ERR wrong number of arguments for 'EXISTS' command"), role
+                    return encode_error("ERR wrong number of arguments for 'EXISTS' command"), role, namespace
                 count = 0
                 for i in range(1, len(args)):
-                    key = args[i].decode("utf-8")
+                    key = namespace_manager.key(namespace, args[i].decode("utf-8"))
                     try:
                         self.store.read(key)
                         count += 1
                     except KeyError:
                         pass
-                return encode_integer(count), role
+                return encode_integer(count), role, namespace
 
             elif cmd in ("INCR", "INCRBY", "DECR", "DECRBY"):
                 if len(args) < 2:
-                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 delta = 1.0
                 if cmd == "INCRBY":
                     if len(args) != 3:
-                        return encode_error("ERR wrong number of arguments for 'INCRBY' command"), role
+                        return encode_error("ERR wrong number of arguments for 'INCRBY' command"), role, namespace
                     delta = float(args[2].decode("utf-8"))
                 elif cmd == "DECR":
                     delta = -1.0
                 elif cmd == "DECRBY":
                     if len(args) != 3:
-                        return encode_error("ERR wrong number of arguments for 'DECRBY' command"), role
+                        return encode_error("ERR wrong number of arguments for 'DECRBY' command"), role, namespace
                     delta = -float(args[2].decode("utf-8"))
                 
                 try:
                     new_val = self.store.incr(key, delta)
-                    return encode_integer(int(new_val)), role
+                    return encode_integer(int(new_val)), role, namespace
                 except TypeError:
-                    return encode_error("ERR value is not an integer or out of range"), role
+                    return encode_error("ERR value is not an integer or out of range"), role, namespace
             
             elif cmd == "EXPIRE":
                 if len(args) != 3:
-                    return encode_error("ERR wrong number of arguments for 'EXPIRE' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error("ERR wrong number of arguments for 'EXPIRE' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 ttl = float(args[2].decode("utf-8"))
                 try:
                     val = self.store.read(key)
                     self.store.update(key, val, ttl)
-                    return encode_integer(1), role
+                    return encode_integer(1), role, namespace
                 except KeyError:
-                    return encode_integer(0), role
+                    return encode_integer(0), role, namespace
 
             elif cmd in ("TTL", "PTTL"):
                 if len(args) != 2:
-                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 try:
                     remaining = self.store.get_ttl(key)
                 except KeyError:
-                    return encode_integer(-2), role
+                    return encode_integer(-2), role, namespace
                 if remaining is None:
-                    return encode_integer(-1), role
+                    return encode_integer(-1), role, namespace
                 if cmd == "TTL":
-                    return encode_integer(int(remaining)), role
-                return encode_integer(int(remaining * 1000.0)), role
+                    return encode_integer(int(remaining)), role, namespace
+                return encode_integer(int(remaining * 1000.0)), role, namespace
 
             elif cmd == "PERSIST":
                 if len(args) != 2:
-                    return encode_error("ERR wrong number of arguments for 'PERSIST' command"), role
-                key = args[1].decode("utf-8")
+                    return encode_error("ERR wrong number of arguments for 'PERSIST' command"), role, namespace
+                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
                 try:
                     cleared = self.store.persist(key)
                 except KeyError:
-                    return encode_integer(0), role
-                return encode_integer(1 if cleared else 0), role
+                    return encode_integer(0), role, namespace
+                return encode_integer(1 if cleared else 0), role, namespace
 
             elif cmd == "INFO":
                 uptime = int(time.time() - registry.get_all()["started_at"])
                 info = f"redis_version:2.0\r\nuptime_in_seconds:{uptime}\r\n"
                 info += f"shards:{settings.SHARDS}\r\n"
-                return encode_bulk_string(info), role
+                info += f"namespace:{namespace}\r\n"
+                return encode_bulk_string(info), role, namespace
 
             elif cmd == "DBSIZE":
-                return encode_integer(len(self.store.keys())), role
+                count = 0
+                for key in self.store.keys():
+                    if namespace_manager.belongs(namespace, key):
+                        count += 1
+                return encode_integer(count), role, namespace
 
             elif cmd == "FLUSHALL":
                 for shard in self.store._shards:
                     with shard._lock:
-                        shard._map.clear()
-                        shard._ttl.clear()
-                        if hasattr(shard, '_skeys'):
-                            shard._skeys.clear()
-                return encode_simple_string("OK"), role
+                        doomed = [key for key in list(shard._map.keys()) if namespace_manager.belongs(namespace, key)]
+                        for key in doomed:
+                            shard._map.pop(key, None)
+                            shard._ttl.pop(key, None)
+                            if hasattr(shard, "_skeys"):
+                                shard._skeys.discard(key)
+                return encode_simple_string("OK"), role, namespace
 
             else:
-                return encode_error(f"ERR unknown command '{cmd}'"), role
+                return encode_error(f"ERR unknown command '{cmd}'"), role, namespace
         
         finally:
             elapsed_ms = (time.time() - start_time) * 1000.0

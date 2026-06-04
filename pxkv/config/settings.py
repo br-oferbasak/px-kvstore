@@ -63,6 +63,18 @@ class Settings:
             self.AUTH_WRITER_PASSWORD = os.getenv("PXKV_AUTH_WRITER_PASSWORD", "")
             self.AUTH_READER_PASSWORD = os.getenv("PXKV_AUTH_READER_PASSWORD", "")
 
+            self.NAMESPACE_ENABLED = os.getenv("PXKV_NAMESPACE_ENABLED", "false").lower() == "true"
+            self.NAMESPACE_DEFAULT = os.getenv("PXKV_NAMESPACE_DEFAULT", "default")
+            self.NAMESPACE_CONFIGS = {}
+            namespace_json = os.getenv("PXKV_NAMESPACE_CONFIGS", "") or ""
+            if namespace_json.strip():
+                try:
+                    parsed = json.loads(namespace_json)
+                    if isinstance(parsed, dict):
+                        self.NAMESPACE_CONFIGS = parsed
+                except Exception as e:
+                    logging.warning("Failed to parse PXKV_NAMESPACE_CONFIGS: %s", e)
+
             self.RATE_LIMIT_ENABLED = os.getenv("PXKV_RATE_LIMIT_ENABLED", "false").lower() == "true"
             self.RATE_LIMIT_DEFAULT = {
                 "rps": float(os.getenv("PXKV_RATE_LIMIT_DEFAULT_RPS", "0") or "0"),
@@ -165,6 +177,8 @@ class Settings:
                 "REPLICATION_SYNC_INTERVAL": float,
                 "REDIS_ENABLED": _to_bool,
                 "RATE_LIMIT_ENABLED": _to_bool,
+                "NAMESPACE_ENABLED": _to_bool,
+                "NAMESPACE_DEFAULT": str,
                 "DISK_THROTTLE_ENABLED": _to_bool,
                 "DISK_THROTTLE_SOFT_PERCENT": float,
                 "DISK_THROTTLE_HARD_PERCENT": float,
@@ -214,6 +228,16 @@ class Settings:
                         logging.info("Setting DISK_THROTTLE_PATHS updated (%d paths)", len(self.DISK_THROTTLE_PATHS))
                     except Exception as e:
                         logging.warning("Failed to update setting DISK_THROTTLE_PATHS: %s", e)
+                elif key == "NAMESPACE_CONFIGS":
+                    try:
+                        if isinstance(val, str):
+                            val = json.loads(val)
+                        if not isinstance(val, dict):
+                            raise TypeError("NAMESPACE_CONFIGS must be an object")
+                        self.NAMESPACE_CONFIGS = val
+                        logging.info("Setting NAMESPACE_CONFIGS updated (%d namespaces)", len(self.NAMESPACE_CONFIGS))
+                    except Exception as e:
+                        logging.warning("Failed to update setting NAMESPACE_CONFIGS: %s", e)
 
     def to_dict(self):
         """Return current settings as a dictionary."""
