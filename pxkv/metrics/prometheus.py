@@ -100,4 +100,26 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
     lines.append("# TYPE pxkv_disk_rejected_total counter")
     lines.append(f"pxkv_disk_rejected_total {int(disk.get('rejected_total', 0) or 0)}")
 
+    hk = metrics.get("hot_keys", {}) or {}
+    lines.append("# HELP pxkv_hot_keys_enabled Whether hot-key detection is enabled (1=on).")
+    lines.append("# TYPE pxkv_hot_keys_enabled gauge")
+    lines.append(f"pxkv_hot_keys_enabled {1 if hk.get('enabled') else 0}")
+    lines.append("# HELP pxkv_hot_keys_tracked Number of distinct keys currently in the detection window.")
+    lines.append("# TYPE pxkv_hot_keys_tracked gauge")
+    lines.append(f"pxkv_hot_keys_tracked {int(hk.get('tracked_keys', 0) or 0)}")
+    lines.append("# HELP pxkv_hot_keys_current Number of currently-hot keys among top-K.")
+    lines.append("# TYPE pxkv_hot_keys_current gauge")
+    lines.append(f"pxkv_hot_keys_current {int(hk.get('hot_keys_current', 0) or 0)}")
+    lines.append("# HELP pxkv_hot_keys_detected_total Distinct keys flagged hot at least once since start.")
+    lines.append("# TYPE pxkv_hot_keys_detected_total counter")
+    lines.append(f"pxkv_hot_keys_detected_total {int(hk.get('hot_keys_detected_total', 0) or 0)}")
+    top = hk.get("top", []) or []
+    if top:
+        lines.append("# HELP pxkv_hot_key_qps Observed QPS for hot-key candidates over the detection window.")
+        lines.append("# TYPE pxkv_hot_key_qps gauge")
+        for entry in top:
+            k_label = str(entry.get("key", "")).replace("\\", "\\\\").replace('"', '\\"')
+            qps = float(entry.get("qps", 0.0) or 0.0)
+            lines.append(f'pxkv_hot_key_qps{{key="{k_label}"}} {qps}')
+
     return "\n".join(lines) + "\n"

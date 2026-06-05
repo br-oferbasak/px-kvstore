@@ -139,7 +139,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Gossip Membership / Discovery**: Auto-discover peers for dynamic follower lists without static config.
 - [x] **Disk Usage Throttling**: Throttle writes when disk usage exceeds configurable thresholds.
 - [x] **Multi-Tenancy (Namespaces)**: Isolate keyspaces into distinct namespaces with separate auth/rate limits.
-- [ ] **Hot Key Detection**: Identify and flag frequently accessed keys for optimization.
+- [x] **Hot Key Detection**: Identify and flag frequently accessed keys for optimization.
 
 ---
 

@@ -135,6 +135,13 @@ class Settings:
             self.DISK_THROTTLE_HARD_USED_BYTES = int(os.getenv("PXKV_DISK_THROTTLE_HARD_USED_BYTES", "0") or "0")
             self.DISK_THROTTLE_DELAY_MS = float(os.getenv("PXKV_DISK_THROTTLE_DELAY_MS", "0") or "0")
             
+            self.HOT_KEY_DETECTION_ENABLED = os.getenv("PXKV_HOT_KEY_DETECTION_ENABLED", "false").lower() == "true"
+            self.HOT_KEY_WINDOW_SECONDS = float(os.getenv("PXKV_HOT_KEY_WINDOW_SECONDS", "60.0") or "60.0")
+            self.HOT_KEY_BUCKETS = int(os.getenv("PXKV_HOT_KEY_BUCKETS", "60") or "60")
+            self.HOT_KEY_TOP_K = int(os.getenv("PXKV_HOT_KEY_TOP_K", "10") or "10")
+            self.HOT_KEY_THRESHOLD_QPS = float(os.getenv("PXKV_HOT_KEY_THRESHOLD_QPS", "0") or "0")
+            self.HOT_KEY_SAMPLE_RATE = float(os.getenv("PXKV_HOT_KEY_SAMPLE_RATE", "1.0") or "1.0")
+
             self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
             self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
             self.GOSSIP_FAILURE_TIMEOUT = float(os.getenv("PXKV_GOSSIP_FAILURE_TIMEOUT", "5.0") or "5.0")
@@ -185,6 +192,12 @@ class Settings:
                 "DISK_THROTTLE_SOFT_USED_BYTES": int,
                 "DISK_THROTTLE_HARD_USED_BYTES": int,
                 "DISK_THROTTLE_DELAY_MS": float,
+                "HOT_KEY_DETECTION_ENABLED": _to_bool,
+                "HOT_KEY_WINDOW_SECONDS": float,
+                "HOT_KEY_BUCKETS": int,
+                "HOT_KEY_TOP_K": int,
+                "HOT_KEY_THRESHOLD_QPS": float,
+                "HOT_KEY_SAMPLE_RATE": float,
             }
             for key, val in new_settings.items():
                 if key in updatable:

@@ -36,6 +36,18 @@ class MetricsRegistry:
                     "last_drop_reason": "",
                 },
             },
+            "hot_keys": {
+                "enabled": False,
+                "window_seconds": 0.0,
+                "buckets": 0,
+                "top_k": 0,
+                "threshold_qps": 0.0,
+                "sample_rate": 1.0,
+                "tracked_keys": 0,
+                "hot_keys_current": 0,
+                "hot_keys_detected_total": 0,
+                "top": [],
+            },
             "disk": {
                 "enabled": False,
                 "paths": [],
@@ -204,6 +216,33 @@ class MetricsRegistry:
         disk = self._metrics.setdefault("disk", {})
         disk["rejected_total"] = int(disk.get("rejected_total", 0) or 0) + 1
         disk["last_reject_reason"] = str(reason or "")
+
+    def observe_hot_keys(self, snapshot: Dict[str, Any]) -> None:
+        hk = self._metrics.setdefault(
+            "hot_keys",
+            {
+                "enabled": False,
+                "window_seconds": 0.0,
+                "buckets": 0,
+                "top_k": 0,
+                "threshold_qps": 0.0,
+                "sample_rate": 1.0,
+                "tracked_keys": 0,
+                "hot_keys_current": 0,
+                "hot_keys_detected_total": 0,
+                "top": [],
+            },
+        )
+        hk["enabled"] = bool(snapshot.get("enabled", False))
+        hk["window_seconds"] = float(snapshot.get("window_seconds", 0.0) or 0.0)
+        hk["buckets"] = int(snapshot.get("buckets", 0) or 0)
+        hk["top_k"] = int(snapshot.get("top_k", 0) or 0)
+        hk["threshold_qps"] = float(snapshot.get("threshold_qps", 0.0) or 0.0)
+        hk["sample_rate"] = float(snapshot.get("sample_rate", 1.0) or 1.0)
+        hk["tracked_keys"] = int(snapshot.get("tracked_keys", 0) or 0)
+        hk["hot_keys_current"] = int(snapshot.get("hot_keys_current", 0) or 0)
+        hk["hot_keys_detected_total"] = int(snapshot.get("hot_keys_detected_total", 0) or 0)
+        hk["top"] = list(snapshot.get("top", []) or [])
 
     def get_all(self) -> Dict[str, Any]:
         return self._metrics

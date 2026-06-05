@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
+from .hotkey import HotKeyDetector
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -108,6 +109,14 @@ class ShardedKeyValueStore(object):
             compression_level=getattr(settings, "COMPRESSION_LEVEL", 6)
         )
         self._replication = ReplicationManager(self)
+        self._hotkeys = HotKeyDetector(
+            enabled=getattr(settings, "HOT_KEY_DETECTION_ENABLED", False),
+            window_seconds=getattr(settings, "HOT_KEY_WINDOW_SECONDS", 60.0),
+            buckets=getattr(settings, "HOT_KEY_BUCKETS", 60),
+            top_k=getattr(settings, "HOT_KEY_TOP_K", 10),
+            threshold_qps=getattr(settings, "HOT_KEY_THRESHOLD_QPS", 0.0),
+            sample_rate=getattr(settings, "HOT_KEY_SAMPLE_RATE", 1.0),
+        )
 
     def _hash_key_material(self, key: Any) -> bytes:
         if isinstance(key, bytes):
@@ -296,10 +305,14 @@ class ShardedKeyValueStore(object):
             return val
 
     def read(self, key: Any) -> Any:
-        return self._bucket(key).read(key)
+        value = self._bucket(key).read(key)
+        self._hotkeys.record(key)
+        return value
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
-        return self._bucket(key).read_with_etag(key)
+        value, etag = self._bucket(key).read_with_etag(key)
+        self._hotkeys.record(key)
+        return value, etag
 
     def patch(
         self,
@@ -358,6 +371,7 @@ class ShardedKeyValueStore(object):
                 self._replication.enqueue_change("delete", key, lsn=lsn)
             shard = self._idx(key)
             notifier.publish("del", key, lsn=lsn, shard=shard)
+            self._hotkeys.forget(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         grouped: Dict[int, list[Any]] = defaultdict(list)
@@ -366,6 +380,8 @@ class ShardedKeyValueStore(object):
         out: Dict[Any, Any] = {}
         for idx, sub in grouped.items():
             out.update(self._shards[idx].mget(sub))
+        if out:
+            self._hotkeys.record_many(out.keys())
         return out
 
     def keys(self) -> List[Any]:

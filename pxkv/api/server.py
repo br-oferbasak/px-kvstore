@@ -231,6 +231,15 @@ def _apply_runtime_config() -> None:
 
     _RATE_LIMITER.configure_from_settings()
 
+    STORE._hotkeys.configure(
+        enabled=getattr(settings, "HOT_KEY_DETECTION_ENABLED", False),
+        window_seconds=getattr(settings, "HOT_KEY_WINDOW_SECONDS", 60.0),
+        buckets=getattr(settings, "HOT_KEY_BUCKETS", 60),
+        top_k=getattr(settings, "HOT_KEY_TOP_K", 10),
+        threshold_qps=getattr(settings, "HOT_KEY_THRESHOLD_QPS", 0.0),
+        sample_rate=getattr(settings, "HOT_KEY_SAMPLE_RATE", 1.0),
+    )
+
     if settings.REDIS_ENABLED:
         if _REDIS_SERVER is None:
             _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -317,7 +326,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return ""
 
     def _rate_limit(self, route: str, namespace: Optional[str] = None) -> bool:
-        if route in ("GET /admin/config", "POST /admin/config", "POST /admin/config/reload"):
+        if route in (
+            "GET /admin/config",
+            "POST /admin/config",
+            "POST /admin/config/reload",
+            "GET /admin/hotkeys",
+            "POST /admin/hotkeys/reset",
+        ):
             return True
         ns = namespace_manager.resolve(namespace)
         if ns is None:
@@ -1422,6 +1437,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/config")
                 return
 
+            if parts == ["admin", "hotkeys", "reset"]:
+                if not self._rate_limit("POST /admin/hotkeys/reset"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                STORE._hotkeys.reset()
+                self._json(200, {"status": "ok"})
+                self._inc_metrics("POST", route="POST /admin/hotkeys/reset")
+                return
+
             if parts == ["admin", "config", "reload"]:
                 if not self._rate_limit("POST /admin/config/reload"):
                     return
@@ -1563,6 +1588,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if parts[0] == "metrics":
             if not self._rate_limit("GET /admin/metrics"):
                 return
+            registry.observe_hot_keys(STORE._hotkeys.snapshot())
             fmt = query.get("format", ["json"])[0]
             if fmt == "prometheus":
                 prom_data = registry_to_prometheus(registry.get_all())
@@ -1570,6 +1596,23 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             else:
                 self._json(200, registry.get_all())
             self._inc_metrics("GET", route="GET /admin/metrics")
+            return
+        if parts[0] == "hotkeys":
+            if not self._rate_limit("GET /admin/hotkeys"):
+                return
+            limit_raw = query.get("limit", [None])[0]
+            try:
+                limit = int(limit_raw) if limit_raw is not None else None
+            except (TypeError, ValueError):
+                self._send(400, "limit must be int")
+                self._inc_metrics("GET", route="GET /admin/hotkeys", error=True)
+                return
+            snap = STORE._hotkeys.snapshot()
+            if limit is not None:
+                snap["top"] = STORE._hotkeys.top_hot_keys(limit=limit)
+            registry.observe_hot_keys(snap)
+            self._json(200, snap)
+            self._inc_metrics("GET", route="GET /admin/hotkeys")
             return
         if parts[0] == "snapshot":
             if not self._rate_limit("GET /admin/snapshot"):
