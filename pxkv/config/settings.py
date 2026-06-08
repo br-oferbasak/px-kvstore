@@ -142,6 +142,11 @@ class Settings:
             self.HOT_KEY_THRESHOLD_QPS = float(os.getenv("PXKV_HOT_KEY_THRESHOLD_QPS", "0") or "0")
             self.HOT_KEY_SAMPLE_RATE = float(os.getenv("PXKV_HOT_KEY_SAMPLE_RATE", "1.0") or "1.0")
 
+            self.HOT_KEY_MITIGATION_ENABLED = os.getenv("PXKV_HOT_KEY_MITIGATION_ENABLED", "false").lower() == "true"
+            self.HOT_KEY_MITIGATION_CACHE_TTL_SECONDS = float(os.getenv("PXKV_HOT_KEY_MITIGATION_CACHE_TTL_SECONDS", "1.0") or "1.0")
+            self.HOT_KEY_MITIGATION_MAX_ENTRIES = int(os.getenv("PXKV_HOT_KEY_MITIGATION_MAX_ENTRIES", "1024") or "1024")
+            self.HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS = float(os.getenv("PXKV_HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS", "1.0") or "1.0")
+
             self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
             self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
             self.GOSSIP_FAILURE_TIMEOUT = float(os.getenv("PXKV_GOSSIP_FAILURE_TIMEOUT", "5.0") or "5.0")

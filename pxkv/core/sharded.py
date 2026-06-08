@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from .hotkey import HotKeyDetector
+from .hotkey_mitigation import HotKeyMitigator
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -117,6 +118,13 @@ class ShardedKeyValueStore(object):
             threshold_qps=getattr(settings, "HOT_KEY_THRESHOLD_QPS", 0.0),
             sample_rate=getattr(settings, "HOT_KEY_SAMPLE_RATE", 1.0),
         )
+        self._hotkey_mitigation = HotKeyMitigator(
+            detector=self._hotkeys,
+            enabled=getattr(settings, "HOT_KEY_MITIGATION_ENABLED", False),
+            cache_ttl_seconds=getattr(settings, "HOT_KEY_MITIGATION_CACHE_TTL_SECONDS", 1.0),
+            max_entries=getattr(settings, "HOT_KEY_MITIGATION_MAX_ENTRIES", 1024),
+            refresh_interval_seconds=getattr(settings, "HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS", 1.0),
+        )
 
     def _hash_key_material(self, key: Any) -> bytes:
         if isinstance(key, bytes):
@@ -213,6 +221,7 @@ class ShardedKeyValueStore(object):
                 )
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
+            self._hotkey_mitigation.invalidate(key)
 
     def update(
         self,
@@ -241,6 +250,7 @@ class ShardedKeyValueStore(object):
                 )
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
+            self._hotkey_mitigation.invalidate(key)
 
     def mset(
         self,
@@ -274,6 +284,7 @@ class ShardedKeyValueStore(object):
             for k in items.keys():
                 shard = self._idx(k)
                 notifier.publish("set", k, lsn=lsn, shard=shard)
+            self._hotkey_mitigation.invalidate_many(items.keys())
 
     def incr(
         self,
@@ -302,17 +313,26 @@ class ShardedKeyValueStore(object):
                 )
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
+            self._hotkey_mitigation.invalidate(key)
             return val
 
     def read(self, key: Any) -> Any:
-        value = self._bucket(key).read(key)
         self._hotkeys.record(key)
-        return value
+        if self._hotkey_mitigation.is_enabled():
+            value, _served = self._hotkey_mitigation.read_through(
+                key, lambda: self._bucket(key).read(key)
+            )
+            return value
+        return self._bucket(key).read(key)
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
-        value, etag = self._bucket(key).read_with_etag(key)
         self._hotkeys.record(key)
-        return value, etag
+        if self._hotkey_mitigation.is_enabled():
+            value, etag, _served = self._hotkey_mitigation.read_through_with_etag(
+                key, lambda: self._bucket(key).read_with_etag(key)
+            )
+            return value, etag
+        return self._bucket(key).read_with_etag(key)
 
     def patch(
         self,
@@ -359,6 +379,7 @@ class ShardedKeyValueStore(object):
                 )
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
+            self._hotkey_mitigation.invalidate(key)
             return new_value, etag
 
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
@@ -372,12 +393,30 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("del", key, lsn=lsn, shard=shard)
             self._hotkeys.forget(key)
+            self._hotkey_mitigation.invalidate(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
-        grouped: Dict[int, list[Any]] = defaultdict(list)
-        for k in keys:
-            grouped[self._idx(k)].append(k)
+        key_list = list(keys)
         out: Dict[Any, Any] = {}
+        if self._hotkey_mitigation.is_enabled():
+            cold_keys: list[Any] = []
+            for k in key_list:
+                if not self._hotkey_mitigation.is_hot(k):
+                    cold_keys.append(k)
+                    continue
+                try:
+                    val, _served = self._hotkey_mitigation.read_through(
+                        k, lambda kk=k: self._bucket(kk).read(kk)
+                    )
+                    out[k] = val
+                except KeyError:
+                    pass
+            keys_to_fetch = cold_keys
+        else:
+            keys_to_fetch = key_list
+        grouped: Dict[int, list[Any]] = defaultdict(list)
+        for k in keys_to_fetch:
+            grouped[self._idx(k)].append(k)
         for idx, sub in grouped.items():
             out.update(self._shards[idx].mget(sub))
         if out:
