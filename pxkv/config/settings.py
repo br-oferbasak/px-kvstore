@@ -147,6 +147,15 @@ class Settings:
             self.HOT_KEY_MITIGATION_MAX_ENTRIES = int(os.getenv("PXKV_HOT_KEY_MITIGATION_MAX_ENTRIES", "1024") or "1024")
             self.HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS = float(os.getenv("PXKV_HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS", "1.0") or "1.0")
 
+            self.ADAPTIVE_TTL_ENABLED = os.getenv("PXKV_ADAPTIVE_TTL_ENABLED", "false").lower() == "true"
+            self.ADAPTIVE_TTL_MIN_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_MIN_SECONDS", "1.0") or "1.0")
+            self.ADAPTIVE_TTL_MAX_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_MAX_SECONDS", "86400.0") or "86400.0")
+            self.ADAPTIVE_TTL_DEFAULT_BASE_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_DEFAULT_BASE_SECONDS", "60.0") or "60.0")
+            self.ADAPTIVE_TTL_HIT_EXTEND_FACTOR = float(os.getenv("PXKV_ADAPTIVE_TTL_HIT_EXTEND_FACTOR", "2.0") or "2.0")
+            self.ADAPTIVE_TTL_MISS_SHRINK_FACTOR = float(os.getenv("PXKV_ADAPTIVE_TTL_MISS_SHRINK_FACTOR", "0.5") or "0.5")
+            self.ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS", "300.0") or "300.0")
+            self.ADAPTIVE_TTL_MAX_TRACKED_KEYS = int(os.getenv("PXKV_ADAPTIVE_TTL_MAX_TRACKED_KEYS", "10000") or "10000")
+
             self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
             self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
             self.GOSSIP_FAILURE_TIMEOUT = float(os.getenv("PXKV_GOSSIP_FAILURE_TIMEOUT", "5.0") or "5.0")
@@ -203,6 +212,14 @@ class Settings:
                 "HOT_KEY_TOP_K": int,
                 "HOT_KEY_THRESHOLD_QPS": float,
                 "HOT_KEY_SAMPLE_RATE": float,
+                "ADAPTIVE_TTL_ENABLED": _to_bool,
+                "ADAPTIVE_TTL_MIN_SECONDS": float,
+                "ADAPTIVE_TTL_MAX_SECONDS": float,
+                "ADAPTIVE_TTL_DEFAULT_BASE_SECONDS": float,
+                "ADAPTIVE_TTL_HIT_EXTEND_FACTOR": float,
+                "ADAPTIVE_TTL_MISS_SHRINK_FACTOR": float,
+                "ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS": float,
+                "ADAPTIVE_TTL_MAX_TRACKED_KEYS": int,
             }
             for key, val in new_settings.items():
                 if key in updatable:

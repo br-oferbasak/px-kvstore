@@ -140,7 +140,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Disk Usage Throttling**: Throttle writes when disk usage exceeds configurable thresholds.
 - [x] **Multi-Tenancy (Namespaces)**: Isolate keyspaces into distinct namespaces with separate auth/rate limits.
 - [x] **Hot Key Detection**: Identify and flag frequently accessed keys for optimization.
-- [ ] **Hot Key Mitigation**: Automatic per-key caching, request coalescing, or replication of detected hot keys.
+- [x] **Hot Key Mitigation**: Automatic per-key caching, request coalescing, or replication of detected hot keys.
 - [ ] **Adaptive TTL**: Tune per-key TTL based on access frequency and recency to maximize hit ratio.
 - [ ] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
 - [ ] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.

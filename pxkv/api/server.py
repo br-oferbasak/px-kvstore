@@ -240,6 +240,17 @@ def _apply_runtime_config() -> None:
         sample_rate=getattr(settings, "HOT_KEY_SAMPLE_RATE", 1.0),
     )
 
+    STORE._adaptive_ttl.configure(
+        enabled=getattr(settings, "ADAPTIVE_TTL_ENABLED", False),
+        min_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_MIN_SECONDS", 1.0),
+        max_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_MAX_SECONDS", 86400.0),
+        default_base_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_DEFAULT_BASE_SECONDS", 60.0),
+        hit_extend_factor=getattr(settings, "ADAPTIVE_TTL_HIT_EXTEND_FACTOR", 2.0),
+        miss_shrink_factor=getattr(settings, "ADAPTIVE_TTL_MISS_SHRINK_FACTOR", 0.5),
+        recency_half_life_seconds=getattr(settings, "ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS", 300.0),
+        max_tracked_keys=getattr(settings, "ADAPTIVE_TTL_MAX_TRACKED_KEYS", 10000),
+    )
+
     if settings.REDIS_ENABLED:
         if _REDIS_SERVER is None:
             _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -332,6 +343,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             "POST /admin/config/reload",
             "GET /admin/hotkeys",
             "POST /admin/hotkeys/reset",
+            "GET /admin/adaptive-ttl",
+            "POST /admin/adaptive-ttl/reset",
         ):
             return True
         ns = namespace_manager.resolve(namespace)
@@ -1447,6 +1460,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/hotkeys/reset")
                 return
 
+            if parts == ["admin", "adaptive-ttl", "reset"]:
+                if not self._rate_limit("POST /admin/adaptive-ttl/reset"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                STORE._adaptive_ttl.reset()
+                self._json(200, {"status": "ok"})
+                self._inc_metrics("POST", route="POST /admin/adaptive-ttl/reset")
+                return
+
             if parts == ["admin", "config", "reload"]:
                 if not self._rate_limit("POST /admin/config/reload"):
                     return
@@ -1613,6 +1636,25 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             registry.observe_hot_keys(snap)
             self._json(200, snap)
             self._inc_metrics("GET", route="GET /admin/hotkeys")
+            return
+        if parts[0] == "adaptive-ttl":
+            if not self._rate_limit("GET /admin/adaptive-ttl"):
+                return
+            limit_raw = query.get("limit", [None])[0]
+            key_raw = query.get("key", [None])[0]
+            try:
+                limit = int(limit_raw) if limit_raw is not None else None
+            except (TypeError, ValueError):
+                self._send(400, "limit must be int")
+                self._inc_metrics("GET", route="GET /admin/adaptive-ttl", error=True)
+                return
+            snap = STORE._adaptive_ttl.snapshot()
+            if limit is not None:
+                snap["top"] = STORE._adaptive_ttl.top_tracked(limit=limit)
+            if key_raw is not None:
+                snap["key"] = STORE._adaptive_ttl.key_stats(key_raw)
+            self._json(200, snap)
+            self._inc_metrics("GET", route="GET /admin/adaptive-ttl")
             return
         if parts[0] == "snapshot":
             if not self._rate_limit("GET /admin/snapshot"):

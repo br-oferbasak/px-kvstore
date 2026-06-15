@@ -15,6 +15,7 @@ from .lru import LRUKeyValueStore
 from .lfu import LFUKeyValueStore
 from .hotkey import HotKeyDetector
 from .hotkey_mitigation import HotKeyMitigator
+from .adaptive_ttl import AdaptiveTTLController
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -125,6 +126,16 @@ class ShardedKeyValueStore(object):
             max_entries=getattr(settings, "HOT_KEY_MITIGATION_MAX_ENTRIES", 1024),
             refresh_interval_seconds=getattr(settings, "HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS", 1.0),
         )
+        self._adaptive_ttl = AdaptiveTTLController(
+            enabled=getattr(settings, "ADAPTIVE_TTL_ENABLED", False),
+            min_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_MIN_SECONDS", 1.0),
+            max_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_MAX_SECONDS", 86400.0),
+            default_base_ttl_seconds=getattr(settings, "ADAPTIVE_TTL_DEFAULT_BASE_SECONDS", 60.0),
+            hit_extend_factor=getattr(settings, "ADAPTIVE_TTL_HIT_EXTEND_FACTOR", 2.0),
+            miss_shrink_factor=getattr(settings, "ADAPTIVE_TTL_MISS_SHRINK_FACTOR", 0.5),
+            recency_half_life_seconds=getattr(settings, "ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS", 300.0),
+            max_tracked_keys=getattr(settings, "ADAPTIVE_TTL_MAX_TRACKED_KEYS", 10000),
+        )
 
     def _hash_key_material(self, key: Any) -> bytes:
         if isinstance(key, bytes):
@@ -194,6 +205,11 @@ class ShardedKeyValueStore(object):
             key, new_value, new_ttl, new_origin_cluster_id, new_origin_ts, policy
         )
 
+    def _tune_ttl(self, key: Any, ttl: Optional[float]) -> Optional[float]:
+        if not self._adaptive_ttl.is_enabled():
+            return ttl
+        return self._adaptive_ttl.suggest_ttl(key, ttl)
+
     def create(
         self,
         key: Any,
@@ -205,6 +221,8 @@ class ShardedKeyValueStore(object):
         origin_ts: Optional[float] = None,
     ) -> None:
         with self._write_lock:
+            ttl = self._tune_ttl(key, ttl)
+            self._adaptive_ttl.record_set(key, ttl)
             self._bucket(key).create(key, value, ttl)
             meta = {
                 "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
@@ -234,6 +252,8 @@ class ShardedKeyValueStore(object):
         origin_ts: Optional[float] = None,
     ) -> None:
         with self._write_lock:
+            ttl = self._tune_ttl(key, ttl)
+            self._adaptive_ttl.record_set(key, ttl)
             self._bucket(key).update(key, value, ttl)
             meta = {
                 "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
@@ -263,10 +283,25 @@ class ShardedKeyValueStore(object):
     ) -> None:
         with self._write_lock:
             grouped: Dict[int, Dict[Any, Any]] = defaultdict(dict)
+            tuned_per_key: Dict[Any, Optional[float]] = {}
+            adaptive_on = self._adaptive_ttl.is_enabled()
             for k, v in items.items():
+                k_ttl = self._tune_ttl(k, ttl)
+                tuned_per_key[k] = k_ttl
+                self._adaptive_ttl.record_set(k, k_ttl)
                 grouped[self._idx(k)][k] = v
             for idx, sub in grouped.items():
-                self._shards[idx].mset(sub, ttl)
+                shard = self._shards[idx]
+                if adaptive_on and any(tuned_per_key.get(k) != ttl for k in sub.keys()):
+                    # Group keys that share the same tuned TTL so each subgroup
+                    # can be written with a single mset call.
+                    by_ttl: Dict[Optional[float], Dict[Any, Any]] = defaultdict(dict)
+                    for k, v in sub.items():
+                        by_ttl[tuned_per_key.get(k)][k] = v
+                    for sub_ttl, sub_items in by_ttl.items():
+                        shard.mset(sub_items, sub_ttl)
+                else:
+                    shard.mset(sub, ttl)
             meta = {
                 "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
                 "origin_ts": origin_ts if origin_ts is not None else time.time(),
@@ -297,6 +332,8 @@ class ShardedKeyValueStore(object):
         origin_ts: Optional[float] = None,
     ) -> float:
         with self._write_lock:
+            ttl = self._tune_ttl(key, ttl)
+            self._adaptive_ttl.record_set(key, ttl)
             val = self._bucket(key).incr(key, delta, ttl)
             meta = {
                 "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
@@ -318,21 +355,33 @@ class ShardedKeyValueStore(object):
 
     def read(self, key: Any) -> Any:
         self._hotkeys.record(key)
-        if self._hotkey_mitigation.is_enabled():
-            value, _served = self._hotkey_mitigation.read_through(
-                key, lambda: self._bucket(key).read(key)
-            )
-            return value
-        return self._bucket(key).read(key)
+        try:
+            if self._hotkey_mitigation.is_enabled():
+                value, _served = self._hotkey_mitigation.read_through(
+                    key, lambda: self._bucket(key).read(key)
+                )
+            else:
+                value = self._bucket(key).read(key)
+        except KeyError:
+            self._adaptive_ttl.record_miss(key)
+            raise
+        self._adaptive_ttl.record_hit(key)
+        return value
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
         self._hotkeys.record(key)
-        if self._hotkey_mitigation.is_enabled():
-            value, etag, _served = self._hotkey_mitigation.read_through_with_etag(
-                key, lambda: self._bucket(key).read_with_etag(key)
-            )
-            return value, etag
-        return self._bucket(key).read_with_etag(key)
+        try:
+            if self._hotkey_mitigation.is_enabled():
+                value, etag, _served = self._hotkey_mitigation.read_through_with_etag(
+                    key, lambda: self._bucket(key).read_with_etag(key)
+                )
+            else:
+                value, etag = self._bucket(key).read_with_etag(key)
+        except KeyError:
+            self._adaptive_ttl.record_miss(key)
+            raise
+        self._adaptive_ttl.record_hit(key)
+        return value, etag
 
     def patch(
         self,
@@ -363,6 +412,8 @@ class ShardedKeyValueStore(object):
             KeyError: If the key doesn't exist
         """
         with self._write_lock:
+            ttl = self._tune_ttl(key, ttl)
+            self._adaptive_ttl.record_set(key, ttl)
             new_value, etag = self._bucket(key).patch(key, patches, ttl)
             meta = {
                 "origin_cluster_id": origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
@@ -394,6 +445,7 @@ class ShardedKeyValueStore(object):
             notifier.publish("del", key, lsn=lsn, shard=shard)
             self._hotkeys.forget(key)
             self._hotkey_mitigation.invalidate(key)
+            self._adaptive_ttl.forget(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         key_list = list(keys)
@@ -421,6 +473,12 @@ class ShardedKeyValueStore(object):
             out.update(self._shards[idx].mget(sub))
         if out:
             self._hotkeys.record_many(out.keys())
+        if self._adaptive_ttl.is_enabled():
+            for k in key_list:
+                if k in out:
+                    self._adaptive_ttl.record_hit(k)
+                else:
+                    self._adaptive_ttl.record_miss(k)
         return out
 
     def keys(self) -> List[Any]:
