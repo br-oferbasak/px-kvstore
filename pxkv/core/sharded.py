@@ -16,6 +16,7 @@ from .lfu import LFUKeyValueStore
 from .hotkey import HotKeyDetector
 from .hotkey_mitigation import HotKeyMitigator
 from .adaptive_ttl import AdaptiveTTLController
+from .cold_eviction import ColdKeyEvictionHints
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -86,10 +87,18 @@ class ShardedKeyValueStore(object):
                 wait_ms=float(tiering_prefetch_wait_ms),
                 cache_max=int(tiering_prefetch_cache_max),
             )
+        self._cold_eviction_hints = ColdKeyEvictionHints(
+            enabled=getattr(settings, "COLD_KEY_HINTS_ENABLED", False),
+            window_seconds=getattr(settings, "COLD_KEY_HINTS_WINDOW_SECONDS", 300.0),
+            buckets=getattr(settings, "COLD_KEY_HINTS_BUCKETS", 10),
+            scan_candidates=getattr(settings, "COLD_KEY_HINTS_SCAN_CANDIDATES", 8),
+            cold_threshold_count=getattr(settings, "COLD_KEY_HINTS_COLD_THRESHOLD_COUNT", 1),
+            max_tracked_keys=getattr(settings, "COLD_KEY_HINTS_MAX_TRACKED_KEYS", 100000),
+        )
         if policy == "lfu":
-            factory = lambda: LFUKeyValueStore(per_shard_max, tiering=tiering)
+            factory = lambda: LFUKeyValueStore(per_shard_max, tiering=tiering, eviction_hints=self._cold_eviction_hints)
         elif policy == "lru":
-            factory = lambda: LRUKeyValueStore(per_shard_max, tiering=tiering)
+            factory = lambda: LRUKeyValueStore(per_shard_max, tiering=tiering, eviction_hints=self._cold_eviction_hints)
         else:
             raise ValueError(f"unknown eviction_policy: {eviction_policy!r}")
         self._eviction_policy = policy
@@ -240,6 +249,7 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
             self._hotkey_mitigation.invalidate(key)
+            self._cold_eviction_hints.record(key)
 
     def update(
         self,
@@ -271,6 +281,7 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
             self._hotkey_mitigation.invalidate(key)
+            self._cold_eviction_hints.record(key)
 
     def mset(
         self,
@@ -320,6 +331,7 @@ class ShardedKeyValueStore(object):
                 shard = self._idx(k)
                 notifier.publish("set", k, lsn=lsn, shard=shard)
             self._hotkey_mitigation.invalidate_many(items.keys())
+            self._cold_eviction_hints.record_many(items.keys())
 
     def incr(
         self,
@@ -351,6 +363,7 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
             self._hotkey_mitigation.invalidate(key)
+            self._cold_eviction_hints.record(key)
             return val
 
     def read(self, key: Any) -> Any:
@@ -366,6 +379,7 @@ class ShardedKeyValueStore(object):
             self._adaptive_ttl.record_miss(key)
             raise
         self._adaptive_ttl.record_hit(key)
+        self._cold_eviction_hints.record(key)
         return value
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
@@ -381,6 +395,7 @@ class ShardedKeyValueStore(object):
             self._adaptive_ttl.record_miss(key)
             raise
         self._adaptive_ttl.record_hit(key)
+        self._cold_eviction_hints.record(key)
         return value, etag
 
     def patch(
@@ -431,6 +446,7 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("set", key, lsn=lsn, shard=shard)
             self._hotkey_mitigation.invalidate(key)
+            self._cold_eviction_hints.record(key)
             return new_value, etag
 
     def delete(self, key: Any, skip_wal: bool = False, skip_replication: bool = False) -> None:
@@ -446,6 +462,7 @@ class ShardedKeyValueStore(object):
             self._hotkeys.forget(key)
             self._hotkey_mitigation.invalidate(key)
             self._adaptive_ttl.forget(key)
+            self._cold_eviction_hints.forget(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         key_list = list(keys)
@@ -473,6 +490,7 @@ class ShardedKeyValueStore(object):
             out.update(self._shards[idx].mget(sub))
         if out:
             self._hotkeys.record_many(out.keys())
+            self._cold_eviction_hints.record_many(out.keys())
         if self._adaptive_ttl.is_enabled():
             for k in key_list:
                 if k in out:
@@ -674,9 +692,9 @@ class ShardedKeyValueStore(object):
             new_shard_list = []
             for i in range(self._num):
                 if self._eviction_policy == "lru":
-                    shard = LRUKeyValueStore(max_size=self._per_shard_max)
+                    shard = LRUKeyValueStore(max_size=self._per_shard_max, eviction_hints=self._cold_eviction_hints)
                 else:
-                    shard = LFUKeyValueStore(max_size=self._per_shard_max)
+                    shard = LFUKeyValueStore(max_size=self._per_shard_max, eviction_hints=self._cold_eviction_hints)
                 new_shard_list.append(shard)
             self._shards = new_shard_list
 

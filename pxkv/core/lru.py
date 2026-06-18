@@ -7,6 +7,7 @@ import json
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from threading import Lock
 from .base import _SortedStringKeyIndex
+from .cold_eviction import ColdKeyEvictionHints
 from ..tiering.base import TieringBackend
 
 try:
@@ -27,7 +28,12 @@ class LRUKeyValueStore(object):
     Thread-safe in-memory LRU key-value store with optional TTL per key.
     """
 
-    def __init__(self, max_size: Optional[int] = None, tiering: Optional[TieringBackend] = None):
+    def __init__(
+        self,
+        max_size: Optional[int] = None,
+        tiering: Optional[TieringBackend] = None,
+        eviction_hints: Optional[ColdKeyEvictionHints] = None,
+    ):
         self._lock = Lock()
         self._max = max_size
         self._map: Dict[Any, _Node] = {}
@@ -35,6 +41,7 @@ class LRUKeyValueStore(object):
         self._xmeta: Dict[Any, Dict[str, Any]] = {}
         self._skeys = _SortedStringKeyIndex()
         self._tiering = tiering
+        self._hints = eviction_hints
 
         self._head = _Node(None, None)
         self._tail = _Node(None, None)
@@ -76,9 +83,28 @@ class LRUKeyValueStore(object):
     def _purge_expired(self) -> None:
         _ = self._purge_expired_keys()
 
+    def _pick_victim(self) -> Optional[_Node]:
+        head_next = self._head.next
+        if head_next is None or head_next is self._tail:
+            return None
+        if self._hints is None or not self._hints.is_enabled():
+            return head_next
+        scan_n = self._hints.scan_candidates()
+        candidates: List[_Node] = []
+        cur = head_next
+        while cur is not None and cur is not self._tail and len(candidates) < scan_n:
+            candidates.append(cur)
+            cur = cur.next
+        if not candidates:
+            return head_next
+        idx = self._hints.pick_lru_victim([n.key for n in candidates])
+        if idx is None:
+            return head_next
+        return candidates[idx]
+
     def _evict_if_needed(self) -> None:
         while self._max and len(self._map) > self._max:
-            lru = self._head.next
+            lru = self._pick_victim()
             if lru is None:
                 break
             if self._tiering is not None and lru.key is not None:

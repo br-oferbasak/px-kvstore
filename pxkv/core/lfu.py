@@ -7,6 +7,7 @@ import json
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from threading import Lock
 from .base import _SortedStringKeyIndex
+from .cold_eviction import ColdKeyEvictionHints
 from ..tiering.base import TieringBackend
 
 try:
@@ -23,7 +24,12 @@ class LFUKeyValueStore(object):
     This is intentionally simple (O(n) eviction) to keep code small and predictable.
     """
 
-    def __init__(self, max_size: Optional[int] = None, tiering: Optional[TieringBackend] = None):
+    def __init__(
+        self,
+        max_size: Optional[int] = None,
+        tiering: Optional[TieringBackend] = None,
+        eviction_hints: Optional[ColdKeyEvictionHints] = None,
+    ):
         self._lock = Lock()
         self._max = max_size
         self._map: Dict[Any, Any] = {}
@@ -34,6 +40,7 @@ class LFUKeyValueStore(object):
         self._last: Dict[Any, int] = {}
         self._skeys = _SortedStringKeyIndex()
         self._tiering = tiering
+        self._hints = eviction_hints
 
     def _touch(self, key: Any) -> None:
         self._seq += 1
@@ -111,11 +118,16 @@ class LFUKeyValueStore(object):
             return True, new_value, new_ttl
 
     def _evict_if_needed(self) -> None:
+        hints_on = self._hints is not None and self._hints.is_enabled()
         while self._max and len(self._map) > self._max:
             victim = None
             best = None
             for k in self._map.keys():
-                score = (self._freq.get(k, 0), self._last.get(k, 0))
+                base = (self._freq.get(k, 0), self._last.get(k, 0))
+                if hints_on:
+                    score = self._hints.adjusted_lfu_score(k, base)
+                else:
+                    score = base
                 if best is None or score < best:
                     best = score
                     victim = k

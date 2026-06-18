@@ -156,6 +156,13 @@ class Settings:
             self.ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS", "300.0") or "300.0")
             self.ADAPTIVE_TTL_MAX_TRACKED_KEYS = int(os.getenv("PXKV_ADAPTIVE_TTL_MAX_TRACKED_KEYS", "10000") or "10000")
 
+            self.COLD_KEY_HINTS_ENABLED = os.getenv("PXKV_COLD_KEY_HINTS_ENABLED", "false").lower() == "true"
+            self.COLD_KEY_HINTS_WINDOW_SECONDS = float(os.getenv("PXKV_COLD_KEY_HINTS_WINDOW_SECONDS", "300.0") or "300.0")
+            self.COLD_KEY_HINTS_BUCKETS = int(os.getenv("PXKV_COLD_KEY_HINTS_BUCKETS", "10") or "10")
+            self.COLD_KEY_HINTS_SCAN_CANDIDATES = int(os.getenv("PXKV_COLD_KEY_HINTS_SCAN_CANDIDATES", "8") or "8")
+            self.COLD_KEY_HINTS_COLD_THRESHOLD_COUNT = int(os.getenv("PXKV_COLD_KEY_HINTS_COLD_THRESHOLD_COUNT", "1") or "1")
+            self.COLD_KEY_HINTS_MAX_TRACKED_KEYS = int(os.getenv("PXKV_COLD_KEY_HINTS_MAX_TRACKED_KEYS", "100000") or "100000")
+
             self.GOSSIP_ENABLED = os.getenv("PXKV_GOSSIP_ENABLED", "false").lower() == "true"
             self.GOSSIP_INTERVAL = float(os.getenv("PXKV_GOSSIP_INTERVAL", "1.0") or "1.0")
             self.GOSSIP_FAILURE_TIMEOUT = float(os.getenv("PXKV_GOSSIP_FAILURE_TIMEOUT", "5.0") or "5.0")
@@ -220,6 +227,12 @@ class Settings:
                 "ADAPTIVE_TTL_MISS_SHRINK_FACTOR": float,
                 "ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS": float,
                 "ADAPTIVE_TTL_MAX_TRACKED_KEYS": int,
+                "COLD_KEY_HINTS_ENABLED": _to_bool,
+                "COLD_KEY_HINTS_WINDOW_SECONDS": float,
+                "COLD_KEY_HINTS_BUCKETS": int,
+                "COLD_KEY_HINTS_SCAN_CANDIDATES": int,
+                "COLD_KEY_HINTS_COLD_THRESHOLD_COUNT": int,
+                "COLD_KEY_HINTS_MAX_TRACKED_KEYS": int,
             }
             for key, val in new_settings.items():
                 if key in updatable:
