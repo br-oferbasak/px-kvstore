@@ -156,6 +156,14 @@ class Settings:
             self.ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS", "300.0") or "300.0")
             self.ADAPTIVE_TTL_MAX_TRACKED_KEYS = int(os.getenv("PXKV_ADAPTIVE_TTL_MAX_TRACKED_KEYS", "10000") or "10000")
 
+            self.HEAVY_HITTERS_ENABLED = os.getenv("PXKV_HEAVY_HITTERS_ENABLED", "false").lower() == "true"
+            self.HEAVY_HITTERS_K = int(os.getenv("PXKV_HEAVY_HITTERS_K", "10") or "10")
+            self.HEAVY_HITTERS_CMS_WIDTH = int(os.getenv("PXKV_HEAVY_HITTERS_CMS_WIDTH", "2048") or "2048")
+            self.HEAVY_HITTERS_CMS_DEPTH = int(os.getenv("PXKV_HEAVY_HITTERS_CMS_DEPTH", "4") or "4")
+            self.HEAVY_HITTERS_DECAY_INTERVAL_SECONDS = float(os.getenv("PXKV_HEAVY_HITTERS_DECAY_INTERVAL_SECONDS", "60.0") or "60.0")
+            self.HEAVY_HITTERS_DECAY_FACTOR = float(os.getenv("PXKV_HEAVY_HITTERS_DECAY_FACTOR", "0.5") or "0.5")
+            self.HEAVY_HITTERS_THRESHOLD_COUNT = int(os.getenv("PXKV_HEAVY_HITTERS_THRESHOLD_COUNT", "0") or "0")
+
             self.COLD_KEY_HINTS_ENABLED = os.getenv("PXKV_COLD_KEY_HINTS_ENABLED", "false").lower() == "true"
             self.COLD_KEY_HINTS_WINDOW_SECONDS = float(os.getenv("PXKV_COLD_KEY_HINTS_WINDOW_SECONDS", "300.0") or "300.0")
             self.COLD_KEY_HINTS_BUCKETS = int(os.getenv("PXKV_COLD_KEY_HINTS_BUCKETS", "10") or "10")
@@ -227,6 +235,13 @@ class Settings:
                 "ADAPTIVE_TTL_MISS_SHRINK_FACTOR": float,
                 "ADAPTIVE_TTL_RECENCY_HALF_LIFE_SECONDS": float,
                 "ADAPTIVE_TTL_MAX_TRACKED_KEYS": int,
+                "HEAVY_HITTERS_ENABLED": _to_bool,
+                "HEAVY_HITTERS_K": int,
+                "HEAVY_HITTERS_CMS_WIDTH": int,
+                "HEAVY_HITTERS_CMS_DEPTH": int,
+                "HEAVY_HITTERS_DECAY_INTERVAL_SECONDS": float,
+                "HEAVY_HITTERS_DECAY_FACTOR": float,
+                "HEAVY_HITTERS_THRESHOLD_COUNT": int,
                 "COLD_KEY_HINTS_ENABLED": _to_bool,
                 "COLD_KEY_HINTS_WINDOW_SECONDS": float,
                 "COLD_KEY_HINTS_BUCKETS": int,

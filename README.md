@@ -142,7 +142,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Hot Key Detection**: Identify and flag frequently accessed keys for optimization.
 - [x] **Hot Key Mitigation**: Automatic per-key caching, request coalescing, or replication of detected hot keys.
 - [x] **Adaptive TTL**: Tune per-key TTL based on access frequency and recency to maximize hit ratio.
-- [ ] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
+- [x] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
 - [ ] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.
 - [ ] **Per-Namespace Hot Key Reports**: Scope hot-key detection by namespace with separate thresholds and top-K lists.
 - [ ] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.

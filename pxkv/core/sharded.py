@@ -17,6 +17,7 @@ from .hotkey import HotKeyDetector
 from .hotkey_mitigation import HotKeyMitigator
 from .adaptive_ttl import AdaptiveTTLController
 from .cold_eviction import ColdKeyEvictionHints
+from .heavy_hitters import TopKHeavyHitters
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -87,6 +88,15 @@ class ShardedKeyValueStore(object):
                 wait_ms=float(tiering_prefetch_wait_ms),
                 cache_max=int(tiering_prefetch_cache_max),
             )
+        self._heavy_hitters = TopKHeavyHitters(
+            enabled=getattr(settings, "HEAVY_HITTERS_ENABLED", False),
+            k=getattr(settings, "HEAVY_HITTERS_K", 10),
+            cms_width=getattr(settings, "HEAVY_HITTERS_CMS_WIDTH", 2048),
+            cms_depth=getattr(settings, "HEAVY_HITTERS_CMS_DEPTH", 4),
+            decay_interval_seconds=getattr(settings, "HEAVY_HITTERS_DECAY_INTERVAL_SECONDS", 60.0),
+            decay_factor=getattr(settings, "HEAVY_HITTERS_DECAY_FACTOR", 0.5),
+            threshold_count=getattr(settings, "HEAVY_HITTERS_THRESHOLD_COUNT", 0),
+        )
         self._cold_eviction_hints = ColdKeyEvictionHints(
             enabled=getattr(settings, "COLD_KEY_HINTS_ENABLED", False),
             window_seconds=getattr(settings, "COLD_KEY_HINTS_WINDOW_SECONDS", 300.0),
@@ -368,6 +378,7 @@ class ShardedKeyValueStore(object):
 
     def read(self, key: Any) -> Any:
         self._hotkeys.record(key)
+        self._heavy_hitters.record(key)
         try:
             if self._hotkey_mitigation.is_enabled():
                 value, _served = self._hotkey_mitigation.read_through(
@@ -384,6 +395,7 @@ class ShardedKeyValueStore(object):
 
     def read_with_etag(self, key: Any) -> Tuple[Any, str]:
         self._hotkeys.record(key)
+        self._heavy_hitters.record(key)
         try:
             if self._hotkey_mitigation.is_enabled():
                 value, etag, _served = self._hotkey_mitigation.read_through_with_etag(
@@ -463,6 +475,7 @@ class ShardedKeyValueStore(object):
             self._hotkey_mitigation.invalidate(key)
             self._adaptive_ttl.forget(key)
             self._cold_eviction_hints.forget(key)
+            self._heavy_hitters.forget(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         key_list = list(keys)
@@ -490,6 +503,7 @@ class ShardedKeyValueStore(object):
             out.update(self._shards[idx].mget(sub))
         if out:
             self._hotkeys.record_many(out.keys())
+            self._heavy_hitters.record_many(out.keys())
             self._cold_eviction_hints.record_many(out.keys())
         if self._adaptive_ttl.is_enabled():
             for k in key_list:
