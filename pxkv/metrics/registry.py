@@ -48,6 +48,19 @@ class MetricsRegistry:
                 "hot_keys_detected_total": 0,
                 "top": [],
             },
+            "heavy_hitters": {
+                "enabled": False,
+                "k": 0,
+                "cms_width": 0,
+                "cms_depth": 0,
+                "threshold_count": 0,
+                "tracked_keys": 0,
+                "records": 0,
+                "decays": 0,
+                "evictions": 0,
+                "detected_total": 0,
+                "top": [],
+            },
             "disk": {
                 "enabled": False,
                 "paths": [],
@@ -243,6 +256,35 @@ class MetricsRegistry:
         hk["hot_keys_current"] = int(snapshot.get("hot_keys_current", 0) or 0)
         hk["hot_keys_detected_total"] = int(snapshot.get("hot_keys_detected_total", 0) or 0)
         hk["top"] = list(snapshot.get("top", []) or [])
+
+    def observe_heavy_hitters(self, snapshot: Dict[str, Any]) -> None:
+        hh = self._metrics.setdefault(
+            "heavy_hitters",
+            {
+                "enabled": False,
+                "k": 0,
+                "cms_width": 0,
+                "cms_depth": 0,
+                "threshold_count": 0,
+                "tracked_keys": 0,
+                "records": 0,
+                "decays": 0,
+                "evictions": 0,
+                "detected_total": 0,
+                "top": [],
+            },
+        )
+        hh["enabled"] = bool(snapshot.get("enabled", False))
+        hh["k"] = int(snapshot.get("k", 0) or 0)
+        hh["cms_width"] = int(snapshot.get("cms_width", 0) or 0)
+        hh["cms_depth"] = int(snapshot.get("cms_depth", 0) or 0)
+        hh["threshold_count"] = int(snapshot.get("threshold_count", 0) or 0)
+        hh["tracked_keys"] = int(snapshot.get("tracked_keys", 0) or 0)
+        hh["records"] = int(snapshot.get("records", 0) or 0)
+        hh["decays"] = int(snapshot.get("decays", 0) or 0)
+        hh["evictions"] = int(snapshot.get("evictions", 0) or 0)
+        hh["detected_total"] = int(snapshot.get("detected_total", 0) or 0)
+        hh["top"] = list(snapshot.get("top", []) or [])
 
     def get_all(self) -> Dict[str, Any]:
         return self._metrics

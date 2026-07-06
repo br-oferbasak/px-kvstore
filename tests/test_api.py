@@ -78,6 +78,7 @@ def test_metrics_prometheus(http_server):
         text = resp.read().decode("utf-8", errors="replace")
     assert "pxkv_requests_total" in text
     assert "pxkv_replication_leader_lsn" in text
+    assert "pxkv_heavy_hitters_enabled" in text
 
 
 def test_replication_snapshot_ndjson_gzip(http_server):

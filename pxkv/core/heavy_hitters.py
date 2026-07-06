@@ -22,6 +22,7 @@ elapses triggers a halving pass.
 """
 
 import time
+import hashlib
 from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -66,7 +67,8 @@ class CountMinSketch:
             raw = key
         else:
             raw = str(key).encode("utf-8", errors="replace")
-        h = hash((self._seeds[row], raw)) & 0xFFFFFFFFFFFFFFFF
+        seed = self._seeds[row].to_bytes(8, "little", signed=False)
+        h = int.from_bytes(hashlib.blake2b(raw, digest_size=8, key=seed).digest(), "little")
         return h % self._width
 
     def add(self, key: Any, count: int = 1) -> int:

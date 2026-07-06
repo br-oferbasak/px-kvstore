@@ -122,4 +122,38 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
             qps = float(entry.get("qps", 0.0) or 0.0)
             lines.append(f'pxkv_hot_key_qps{{key="{k_label}"}} {qps}')
 
+    hh = metrics.get("heavy_hitters", {}) or {}
+    lines.append("# HELP pxkv_heavy_hitters_enabled Whether Count-Min Sketch heavy-hitter tracking is enabled (1=on).")
+    lines.append("# TYPE pxkv_heavy_hitters_enabled gauge")
+    lines.append(f"pxkv_heavy_hitters_enabled {1 if hh.get('enabled') else 0}")
+    lines.append("# HELP pxkv_heavy_hitters_tracked Number of top-K candidate keys currently tracked.")
+    lines.append("# TYPE pxkv_heavy_hitters_tracked gauge")
+    lines.append(f"pxkv_heavy_hitters_tracked {int(hh.get('tracked_keys', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_records_total Number of access records processed by heavy-hitter tracking.")
+    lines.append("# TYPE pxkv_heavy_hitters_records_total counter")
+    lines.append(f"pxkv_heavy_hitters_records_total {int(hh.get('records', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_evictions_total Number of top-K candidate replacements.")
+    lines.append("# TYPE pxkv_heavy_hitters_evictions_total counter")
+    lines.append(f"pxkv_heavy_hitters_evictions_total {int(hh.get('evictions', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_decays_total Number of Count-Min Sketch decay passes.")
+    lines.append("# TYPE pxkv_heavy_hitters_decays_total counter")
+    lines.append(f"pxkv_heavy_hitters_decays_total {int(hh.get('decays', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_detected_total Distinct top-K candidates flagged hot at least once since start.")
+    lines.append("# TYPE pxkv_heavy_hitters_detected_total counter")
+    lines.append(f"pxkv_heavy_hitters_detected_total {int(hh.get('detected_total', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_cms_width Count-Min Sketch width.")
+    lines.append("# TYPE pxkv_heavy_hitters_cms_width gauge")
+    lines.append(f"pxkv_heavy_hitters_cms_width {int(hh.get('cms_width', 0) or 0)}")
+    lines.append("# HELP pxkv_heavy_hitters_cms_depth Count-Min Sketch depth.")
+    lines.append("# TYPE pxkv_heavy_hitters_cms_depth gauge")
+    lines.append(f"pxkv_heavy_hitters_cms_depth {int(hh.get('cms_depth', 0) or 0)}")
+    hh_top = hh.get("top", []) or []
+    if hh_top:
+        lines.append("# HELP pxkv_heavy_hitter_estimated_count CMS-estimated access count for top-K candidates.")
+        lines.append("# TYPE pxkv_heavy_hitter_estimated_count gauge")
+        for entry in hh_top:
+            k_label = str(entry.get("key", "")).replace("\\", "\\\\").replace('"', '\\"')
+            count = int(entry.get("estimated_count", 0) or 0)
+            lines.append(f'pxkv_heavy_hitter_estimated_count{{key="{k_label}"}} {count}')
+
     return "\n".join(lines) + "\n"

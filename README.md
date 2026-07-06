@@ -102,6 +102,18 @@ redis-cli -p 6379 GET mykey
 ```
 Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`, `DECR`, `DECRBY`, `EXPIRE`, `TTL`, `PTTL`, `PERSIST`, `PING`, `INFO`, `DBSIZE`, `FLUSHALL`.
 
+### **Top-K Heavy Hitters**
+Enable bounded-memory hot-key tracking for high-cardinality read workloads:
+```bash
+export PXKV_HEAVY_HITTERS_ENABLED=true
+export PXKV_HEAVY_HITTERS_K=20
+export PXKV_HEAVY_HITTERS_CMS_WIDTH=4096
+export PXKV_HEAVY_HITTERS_CMS_DEPTH=4
+export PXKV_HEAVY_HITTERS_THRESHOLD_COUNT=1000
+```
+
+The tracker records successful `GET`/`MGET` reads into a Count-Min Sketch and keeps only the top-K candidate keys in memory. Inspect it with `GET /admin/heavy-hitters?limit=20`, query a single key with `GET /admin/heavy-hitters?key=mykey`, reset it with `POST /admin/heavy-hitters/reset`, or scrape the `pxkv_heavy_hitters_*` Prometheus metrics.
+
 ---
 
 ## **Roadmap**
@@ -143,7 +155,7 @@ Supported commands: `SET` (with EX/PX), `GET`, `DEL`, `EXISTS`, `INCR`, `INCRBY`
 - [x] **Hot Key Mitigation**: Automatic per-key caching, request coalescing, or replication of detected hot keys.
 - [x] **Adaptive TTL**: Tune per-key TTL based on access frequency and recency to maximize hit ratio.
 - [x] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
-- [ ] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.
+- [x] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.
 - [ ] **Per-Namespace Hot Key Reports**: Scope hot-key detection by namespace with separate thresholds and top-K lists.
 - [ ] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
 - [ ] **Vector Indexing**: Native support for vector similarity search (HNSW) for embedding workloads.

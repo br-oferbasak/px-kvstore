@@ -114,3 +114,49 @@ def test_config_reload_from_file(server):
         assert resp.status == 200
         body = json.loads(resp.read().decode("utf-8"))
     assert body["FAULT_LATENCY_MS"] == 50.0
+
+
+def test_config_hot_reload_applies_heavy_hitters(server):
+    base_url, _proc, _config_file = server
+
+    data = json.dumps(
+        {
+            "HEAVY_HITTERS_ENABLED": True,
+            "HEAVY_HITTERS_K": 3,
+            "HEAVY_HITTERS_CMS_WIDTH": 256,
+            "HEAVY_HITTERS_CMS_DEPTH": 3,
+            "HEAVY_HITTERS_THRESHOLD_COUNT": 2,
+            "HEAVY_HITTERS_DECAY_INTERVAL_SECONDS": 0,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/admin/config",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        assert resp.status == 200
+
+    put = urllib.request.Request(
+        f"{base_url}/kv/cms_hot",
+        data=json.dumps({"value": "v"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(put, timeout=2.0) as resp:
+        assert resp.status in (200, 201)
+
+    for _ in range(3):
+        with urllib.request.urlopen(f"{base_url}/kv/cms_hot", timeout=2.0) as resp:
+            assert resp.status == 200
+
+    with urllib.request.urlopen(f"{base_url}/admin/heavy-hitters?key=cms_hot", timeout=2.0) as resp:
+        assert resp.status == 200
+        body = json.loads(resp.read().decode("utf-8"))
+    assert body["enabled"] is True
+    assert body["k"] == 3
+    assert body["cms_width"] == 256
+    assert body["query"]["estimated_count"] >= 3
+    assert body["query"]["hot"] is True
+    assert body["top"][0]["key"] == "cms_hot"

@@ -251,6 +251,16 @@ def _apply_runtime_config() -> None:
         max_tracked_keys=getattr(settings, "ADAPTIVE_TTL_MAX_TRACKED_KEYS", 10000),
     )
 
+    STORE._heavy_hitters.configure(
+        enabled=getattr(settings, "HEAVY_HITTERS_ENABLED", False),
+        k=getattr(settings, "HEAVY_HITTERS_K", 10),
+        cms_width=getattr(settings, "HEAVY_HITTERS_CMS_WIDTH", 2048),
+        cms_depth=getattr(settings, "HEAVY_HITTERS_CMS_DEPTH", 4),
+        decay_interval_seconds=getattr(settings, "HEAVY_HITTERS_DECAY_INTERVAL_SECONDS", 60.0),
+        decay_factor=getattr(settings, "HEAVY_HITTERS_DECAY_FACTOR", 0.5),
+        threshold_count=getattr(settings, "HEAVY_HITTERS_THRESHOLD_COUNT", 0),
+    )
+
     if settings.REDIS_ENABLED:
         if _REDIS_SERVER is None:
             _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -343,6 +353,8 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             "POST /admin/config/reload",
             "GET /admin/hotkeys",
             "POST /admin/hotkeys/reset",
+            "GET /admin/heavy-hitters",
+            "POST /admin/heavy-hitters/reset",
             "GET /admin/adaptive-ttl",
             "POST /admin/adaptive-ttl/reset",
         ):
@@ -1460,6 +1472,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/hotkeys/reset")
                 return
 
+            if parts == ["admin", "heavy-hitters", "reset"]:
+                if not self._rate_limit("POST /admin/heavy-hitters/reset"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                STORE._heavy_hitters.reset()
+                self._json(200, {"status": "ok"})
+                self._inc_metrics("POST", route="POST /admin/heavy-hitters/reset")
+                return
+
             if parts == ["admin", "adaptive-ttl", "reset"]:
                 if not self._rate_limit("POST /admin/adaptive-ttl/reset"):
                     return
@@ -1612,6 +1634,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._rate_limit("GET /admin/metrics"):
                 return
             registry.observe_hot_keys(STORE._hotkeys.snapshot())
+            registry.observe_heavy_hitters(STORE._heavy_hitters.snapshot())
             fmt = query.get("format", ["json"])[0]
             if fmt == "prometheus":
                 prom_data = registry_to_prometheus(registry.get_all())
@@ -1636,6 +1659,31 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             registry.observe_hot_keys(snap)
             self._json(200, snap)
             self._inc_metrics("GET", route="GET /admin/hotkeys")
+            return
+        if parts[0] == "heavy-hitters":
+            if not self._rate_limit("GET /admin/heavy-hitters"):
+                return
+            limit_raw = query.get("limit", [None])[0]
+            key_raw = query.get("key", [None])[0]
+            try:
+                limit = int(limit_raw) if limit_raw is not None else None
+            except (TypeError, ValueError):
+                self._send(400, "limit must be int")
+                self._inc_metrics("GET", route="GET /admin/heavy-hitters", error=True)
+                return
+            snap = STORE._heavy_hitters.snapshot()
+            if limit is not None:
+                snap["top"] = STORE._heavy_hitters.top_k(limit=limit)
+            if key_raw is not None:
+                key = self._ns_key(self._namespace_from_query(query), key_raw)
+                snap["query"] = {
+                    "key": key_raw,
+                    "estimated_count": STORE._heavy_hitters.estimate(key),
+                    "hot": STORE._heavy_hitters.is_hot(key),
+                }
+            registry.observe_heavy_hitters(snap)
+            self._json(200, snap)
+            self._inc_metrics("GET", route="GET /admin/heavy-hitters")
             return
         if parts[0] == "adaptive-ttl":
             if not self._rate_limit("GET /admin/adaptive-ttl"):
