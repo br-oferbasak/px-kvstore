@@ -337,6 +337,25 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         ns = namespace_manager.resolve(namespace)
         return namespace_manager.user_prefix(ns or namespace_manager.default(), prefix)
 
+    def _hot_key_report_for_namespace(self, namespace: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        top_k = namespace_manager.hot_key_top_k(namespace) if limit is None else max(1, int(limit))
+        threshold_qps = namespace_manager.hot_key_threshold_qps(namespace)
+        return STORE._hotkeys.report(
+            limit=top_k,
+            threshold_qps=threshold_qps,
+            key_filter=lambda k, ns=namespace: namespace_manager.belongs(ns, k),
+            key_mapper=lambda k, ns=namespace: namespace_manager.strip(ns, k),
+            namespace=namespace,
+        )
+
+    def _hot_key_namespace_reports(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        reports = [self._hot_key_report_for_namespace(ns, limit=limit) for ns in namespace_manager.known_namespaces()]
+        return {
+            "enabled": STORE._hotkeys.is_enabled(),
+            "namespaces": reports,
+            "namespace_count": len(reports),
+        }
+
     def _client_ip(self) -> str:
         xff = self.headers.get("X-Forwarded-For", "") or ""
         if xff.strip():
@@ -1634,6 +1653,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if not self._rate_limit("GET /admin/metrics"):
                 return
             registry.observe_hot_keys(STORE._hotkeys.snapshot())
+            registry.observe_namespace_hot_keys(self._hot_key_namespace_reports())
             registry.observe_heavy_hitters(STORE._heavy_hitters.snapshot())
             fmt = query.get("format", ["json"])[0]
             if fmt == "prometheus":
@@ -1653,10 +1673,30 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send(400, "limit must be int")
                 self._inc_metrics("GET", route="GET /admin/hotkeys", error=True)
                 return
-            snap = STORE._hotkeys.snapshot()
-            if limit is not None:
-                snap["top"] = STORE._hotkeys.top_hot_keys(limit=limit)
-            registry.observe_hot_keys(snap)
+            if len(parts) > 1 and parts[1] == "namespaces":
+                snap = self._hot_key_namespace_reports(limit=limit)
+                registry.observe_namespace_hot_keys(snap)
+                self._json(200, snap)
+                self._inc_metrics("GET", route="GET /admin/hotkeys/namespaces")
+                return
+            namespace_requested = (
+                "namespace" in query
+                or "ns" in query
+                or bool(self.headers.get(NAMESPACE_HEADER, "") or "")
+            )
+            if namespace_requested:
+                namespace = self._namespace_from_query(query)
+                if namespace is None:
+                    self._send(400, "Invalid namespace")
+                    self._inc_metrics("GET", route="GET /admin/hotkeys", error=True)
+                    return
+                snap = self._hot_key_report_for_namespace(namespace, limit=limit)
+                registry.observe_namespace_hot_keys({"enabled": snap.get("enabled", False), "namespaces": [snap], "namespace_count": 1})
+            else:
+                snap = STORE._hotkeys.snapshot()
+                if limit is not None:
+                    snap["top"] = STORE._hotkeys.top_hot_keys(limit=limit)
+                registry.observe_hot_keys(snap)
             self._json(200, snap)
             self._inc_metrics("GET", route="GET /admin/hotkeys")
             return

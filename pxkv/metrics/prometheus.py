@@ -122,6 +122,30 @@ def registry_to_prometheus(metrics: Dict[str, Any]) -> str:
             qps = float(entry.get("qps", 0.0) or 0.0)
             lines.append(f'pxkv_hot_key_qps{{key="{k_label}"}} {qps}')
 
+    ns_hk = metrics.get("namespace_hot_keys", {}) or {}
+    lines.append("# HELP pxkv_namespace_hot_keys_tracked Number of distinct hot-key candidates tracked per namespace.")
+    lines.append("# TYPE pxkv_namespace_hot_keys_tracked gauge")
+    lines.append("# HELP pxkv_namespace_hot_keys_current Number of currently-hot keys among namespace top-K candidates.")
+    lines.append("# TYPE pxkv_namespace_hot_keys_current gauge")
+    ns_reports = ns_hk.get("namespaces", []) or []
+    for report in ns_reports:
+        ns_label = str(report.get("namespace", "")).replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(
+            f'pxkv_namespace_hot_keys_tracked{{namespace="{ns_label}"}} {int(report.get("tracked_keys", 0) or 0)}'
+        )
+        lines.append(
+            f'pxkv_namespace_hot_keys_current{{namespace="{ns_label}"}} {int(report.get("hot_keys_current", 0) or 0)}'
+        )
+    if ns_reports:
+        lines.append("# HELP pxkv_namespace_hot_key_qps Observed QPS for namespace-scoped hot-key candidates.")
+        lines.append("# TYPE pxkv_namespace_hot_key_qps gauge")
+        for report in ns_reports:
+            ns_label = str(report.get("namespace", "")).replace("\\", "\\\\").replace('"', '\\"')
+            for entry in report.get("top", []) or []:
+                k_label = str(entry.get("key", "")).replace("\\", "\\\\").replace('"', '\\"')
+                qps = float(entry.get("qps", 0.0) or 0.0)
+                lines.append(f'pxkv_namespace_hot_key_qps{{namespace="{ns_label}",key="{k_label}"}} {qps}')
+
     hh = metrics.get("heavy_hitters", {}) or {}
     lines.append("# HELP pxkv_heavy_hitters_enabled Whether Count-Min Sketch heavy-hitter tracking is enabled (1=on).")
     lines.append("# TYPE pxkv_heavy_hitters_enabled gauge")

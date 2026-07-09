@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .auth import best_role_for_secret
 from .config.settings import settings
@@ -114,6 +114,43 @@ class NamespaceManager:
         if isinstance(pol, dict):
             return pol
         return getattr(settings, "RATE_LIMIT_ROUTES", None) or {}
+
+    def hot_key_config(self, namespace: str) -> Dict[str, Any]:
+        cfg = self.config(namespace)
+        nested = cfg.get("hot_keys", {}) or {}
+        out = dict(nested) if isinstance(nested, dict) else {}
+        for src, dst in (
+            ("hot_key_top_k", "top_k"),
+            ("hot_key_threshold_qps", "threshold_qps"),
+            ("hot_key_window_seconds", "window_seconds"),
+        ):
+            if src in cfg:
+                out[dst] = cfg[src]
+        return out
+
+    def hot_key_top_k(self, namespace: str) -> int:
+        cfg = self.hot_key_config(namespace)
+        try:
+            return max(1, int(cfg.get("top_k", getattr(settings, "HOT_KEY_TOP_K", 10)) or 10))
+        except (TypeError, ValueError):
+            return max(1, int(getattr(settings, "HOT_KEY_TOP_K", 10) or 10))
+
+    def hot_key_threshold_qps(self, namespace: str) -> float:
+        cfg = self.hot_key_config(namespace)
+        try:
+            return max(0.0, float(cfg.get("threshold_qps", getattr(settings, "HOT_KEY_THRESHOLD_QPS", 0.0)) or 0.0))
+        except (TypeError, ValueError):
+            return max(0.0, float(getattr(settings, "HOT_KEY_THRESHOLD_QPS", 0.0) or 0.0))
+
+    def known_namespaces(self) -> List[str]:
+        names = [self.default()]
+        cfg = getattr(settings, "NAMESPACE_CONFIGS", {}) or {}
+        if isinstance(cfg, dict):
+            for name in cfg.keys():
+                value = str(name).strip()
+                if self.is_valid(value) and value not in names:
+                    names.append(value)
+        return names
 
     def scope(self, namespace: Optional[str]) -> str:
         ns = self.resolve(namespace)

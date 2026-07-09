@@ -48,6 +48,11 @@ class MetricsRegistry:
                 "hot_keys_detected_total": 0,
                 "top": [],
             },
+            "namespace_hot_keys": {
+                "enabled": False,
+                "namespace_count": 0,
+                "namespaces": [],
+            },
             "heavy_hitters": {
                 "enabled": False,
                 "k": 0,
@@ -256,6 +261,20 @@ class MetricsRegistry:
         hk["hot_keys_current"] = int(snapshot.get("hot_keys_current", 0) or 0)
         hk["hot_keys_detected_total"] = int(snapshot.get("hot_keys_detected_total", 0) or 0)
         hk["top"] = list(snapshot.get("top", []) or [])
+
+    def observe_namespace_hot_keys(self, snapshot: Dict[str, Any]) -> None:
+        ns_hk = self._metrics.setdefault(
+            "namespace_hot_keys",
+            {
+                "enabled": False,
+                "namespace_count": 0,
+                "namespaces": [],
+            },
+        )
+        reports = list(snapshot.get("namespaces", []) or [])
+        ns_hk["enabled"] = bool(snapshot.get("enabled", False))
+        ns_hk["namespace_count"] = int(snapshot.get("namespace_count", len(reports)) or 0)
+        ns_hk["namespaces"] = reports
 
     def observe_heavy_hitters(self, snapshot: Dict[str, Any]) -> None:
         hh = self._metrics.setdefault(

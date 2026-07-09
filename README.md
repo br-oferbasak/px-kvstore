@@ -114,6 +114,18 @@ export PXKV_HEAVY_HITTERS_THRESHOLD_COUNT=1000
 
 The tracker records successful `GET`/`MGET` reads into a Count-Min Sketch and keeps only the top-K candidate keys in memory. Inspect it with `GET /admin/heavy-hitters?limit=20`, query a single key with `GET /admin/heavy-hitters?key=mykey`, reset it with `POST /admin/heavy-hitters/reset`, or scrape the `pxkv_heavy_hitters_*` Prometheus metrics.
 
+### **Per-Namespace Hot Key Reports**
+When namespaces are enabled, hot-key reports can be scoped per tenant:
+```bash
+export PXKV_NAMESPACE_ENABLED=true
+export PXKV_NAMESPACE_CONFIGS='{
+  "tenant-a": {"hot_keys": {"top_k": 5, "threshold_qps": 100}},
+  "tenant-b": {"hot_keys": {"top_k": 20, "threshold_qps": 25}}
+}'
+```
+
+Use `GET /admin/hotkeys?namespace=tenant-a` for one namespace or `GET /admin/hotkeys/namespaces` for all configured namespaces. Reports strip the internal namespace prefix from keys and expose `pxkv_namespace_hot_keys_*` Prometheus metrics.
+
 ---
 
 ## **Roadmap**
@@ -156,7 +168,7 @@ The tracker records successful `GET`/`MGET` reads into a Count-Min Sketch and ke
 - [x] **Adaptive TTL**: Tune per-key TTL based on access frequency and recency to maximize hit ratio.
 - [x] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
 - [x] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.
-- [ ] **Per-Namespace Hot Key Reports**: Scope hot-key detection by namespace with separate thresholds and top-K lists.
+- [x] **Per-Namespace Hot Key Reports**: Scope hot-key detection by namespace with separate thresholds and top-K lists.
 - [ ] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
 - [ ] **Vector Indexing**: Native support for vector similarity search (HNSW) for embedding workloads.
 - [ ] **Snapshot Diff / Incremental Backup**: Ship only changed pages between snapshots to cut backup cost.

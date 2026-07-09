@@ -12,7 +12,7 @@ A key is "hot" when its access rate (sum / window) exceeds THRESHOLD_QPS.
 import time
 from collections import defaultdict
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 
 class HotKeyDetector:
@@ -140,7 +140,14 @@ class HotKeyDetector:
                 totals[k] += c
         return totals
 
-    def top_hot_keys(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def top_hot_keys(
+        self,
+        limit: Optional[int] = None,
+        threshold_qps: Optional[float] = None,
+        key_filter: Optional[Callable[[Any], bool]] = None,
+        key_mapper: Optional[Callable[[Any], Any]] = None,
+        detection_scope: str = "",
+    ) -> List[Dict[str, Any]]:
         """Return up to `limit` (default top_k) hottest keys with stats.
 
         Each entry: {"key": str, "count": int, "qps": float, "hot": bool}.
@@ -151,24 +158,96 @@ class HotKeyDetector:
         with self._lock:
             now = time.time()
             totals = self._aggregate_locked(now)
+            if key_filter is not None:
+                totals = {k: c for k, c in totals.items() if key_filter(k)}
             if not totals:
                 return []
             lim = self._top_k if limit is None else max(1, int(limit))
+            threshold = self._threshold_qps if threshold_qps is None else max(0.0, float(threshold_qps))
             ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:lim]
             out: List[Dict[str, Any]] = []
             for k, c in ranked:
                 qps = float(c) / self._window_s if self._window_s > 0 else 0.0
-                hot = self._threshold_qps > 0.0 and qps >= self._threshold_qps
+                hot = threshold > 0.0 and qps >= threshold
                 if hot:
-                    if k not in self._last_detected:
+                    detection_key = f"{detection_scope}:{repr(k)}" if detection_scope else k
+                    if detection_key not in self._last_detected:
                         self._detected_total += 1
-                    self._last_detected[k] = now
+                    self._last_detected[detection_key] = now
+                display_key = key_mapper(k) if key_mapper is not None else k
                 out.append({
-                    "key": k if isinstance(k, str) else str(k),
+                    "key": display_key if isinstance(display_key, str) else str(display_key),
                     "count": int(c),
                     "qps": qps,
                     "hot": hot,
                 })
+            return out
+
+    def report(
+        self,
+        limit: Optional[int] = None,
+        threshold_qps: Optional[float] = None,
+        key_filter: Optional[Callable[[Any], bool]] = None,
+        key_mapper: Optional[Callable[[Any], Any]] = None,
+        namespace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a metrics-friendly report, optionally scoped to a key subset."""
+        with self._lock:
+            threshold = self._threshold_qps if threshold_qps is None else max(0.0, float(threshold_qps))
+            lim = self._top_k if limit is None else max(1, int(limit))
+            if not self._enabled:
+                out = {
+                    "enabled": False,
+                    "window_seconds": self._window_s,
+                    "buckets": self._buckets_n,
+                    "top_k": lim,
+                    "threshold_qps": threshold,
+                    "sample_rate": self._sample_rate,
+                    "tracked_keys": 0,
+                    "hot_keys_current": 0,
+                    "hot_keys_detected_total": int(self._detected_total),
+                    "top": [],
+                }
+                if namespace is not None:
+                    out["namespace"] = namespace
+                return out
+
+            now = time.time()
+            totals = self._aggregate_locked(now)
+            if key_filter is not None:
+                totals = {k: c for k, c in totals.items() if key_filter(k)}
+            ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:lim]
+            top: List[Dict[str, Any]] = []
+            scope = f"namespace:{namespace}" if namespace is not None else ""
+            for k, c in ranked:
+                qps = float(c) / self._window_s if self._window_s > 0 else 0.0
+                hot = threshold > 0.0 and qps >= threshold
+                if hot:
+                    detection_key = f"{scope}:{repr(k)}" if scope else k
+                    if detection_key not in self._last_detected:
+                        self._detected_total += 1
+                    self._last_detected[detection_key] = now
+                display_key = key_mapper(k) if key_mapper is not None else k
+                top.append({
+                    "key": display_key if isinstance(display_key, str) else str(display_key),
+                    "count": int(c),
+                    "qps": qps,
+                    "hot": hot,
+                })
+            out = {
+                "enabled": True,
+                "window_seconds": self._window_s,
+                "buckets": self._buckets_n,
+                "top_k": lim,
+                "threshold_qps": threshold,
+                "sample_rate": self._sample_rate,
+                "tracked_keys": len(totals),
+                "hot_keys_current": sum(1 for e in top if e.get("hot")),
+                "hot_keys_detected_total": int(self._detected_total),
+                "top": top,
+            }
+            if namespace is not None:
+                out["namespace"] = namespace
             return out
 
     def snapshot(self) -> Dict[str, Any]:
@@ -187,18 +266,4 @@ class HotKeyDetector:
                     "hot_keys_detected_total": int(self._detected_total),
                     "top": [],
                 }
-            top = self.top_hot_keys(limit=self._top_k)
-            hot_now = sum(1 for e in top if e.get("hot"))
-            tracked = len({k for b in self._buckets for k in b.keys()})
-            return {
-                "enabled": True,
-                "window_seconds": self._window_s,
-                "buckets": self._buckets_n,
-                "top_k": self._top_k,
-                "threshold_qps": self._threshold_qps,
-                "sample_rate": self._sample_rate,
-                "tracked_keys": tracked,
-                "hot_keys_current": hot_now,
-                "hot_keys_detected_total": int(self._detected_total),
-                "top": top,
-            }
+            return self.report(limit=self._top_k)
