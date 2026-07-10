@@ -1,0 +1,48 @@
+name: Benchmark reproduction
+description: Share a reproducible benchmark result
+title: "[Benchmark]: "
+labels: ["benchmark"]
+body:
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or release
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and operating system
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: PX-KVStore configuration
+      description: Include shards, persistence, clients, workload, and relevant environment variables.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands used
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results and raw output
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Methodology notes
+      description: Include warm-up, run count, variance, and any limitations.
