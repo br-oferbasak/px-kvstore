@@ -147,6 +147,9 @@ class Settings:
             self.HOT_KEY_MITIGATION_MAX_ENTRIES = int(os.getenv("PXKV_HOT_KEY_MITIGATION_MAX_ENTRIES", "1024") or "1024")
             self.HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS = float(os.getenv("PXKV_HOT_KEY_MITIGATION_REFRESH_INTERVAL_SECONDS", "1.0") or "1.0")
 
+            self.QUERY_PLAN_CACHE_ENABLED = os.getenv("PXKV_QUERY_PLAN_CACHE_ENABLED", "false").lower() == "true"
+            self.QUERY_PLAN_CACHE_MAX_ENTRIES = int(os.getenv("PXKV_QUERY_PLAN_CACHE_MAX_ENTRIES", "1024") or "1024")
+
             self.ADAPTIVE_TTL_ENABLED = os.getenv("PXKV_ADAPTIVE_TTL_ENABLED", "false").lower() == "true"
             self.ADAPTIVE_TTL_MIN_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_MIN_SECONDS", "1.0") or "1.0")
             self.ADAPTIVE_TTL_MAX_SECONDS = float(os.getenv("PXKV_ADAPTIVE_TTL_MAX_SECONDS", "86400.0") or "86400.0")
@@ -227,6 +230,8 @@ class Settings:
                 "HOT_KEY_TOP_K": int,
                 "HOT_KEY_THRESHOLD_QPS": float,
                 "HOT_KEY_SAMPLE_RATE": float,
+                "QUERY_PLAN_CACHE_ENABLED": _to_bool,
+                "QUERY_PLAN_CACHE_MAX_ENTRIES": int,
                 "ADAPTIVE_TTL_ENABLED": _to_bool,
                 "ADAPTIVE_TTL_MIN_SECONDS": float,
                 "ADAPTIVE_TTL_MAX_SECONDS": float,

@@ -23,6 +23,20 @@ class MetricsRegistry:
                 "misses": 0,
                 "stores": 0,
             },
+            "query_plan_cache": {
+                "enabled": False,
+                "max_entries": 0,
+                "redis_entries": 0,
+                "scan_entries": 0,
+                "redis_hits": 0,
+                "redis_misses": 0,
+                "redis_cached": 0,
+                "redis_hit_ratio": 0.0,
+                "scan_hits": 0,
+                "scan_misses": 0,
+                "scan_cached": 0,
+                "scan_hit_ratio": 0.0,
+            },
             "replication": {
                 "leader_lsn": 0,
                 "followers": {},
@@ -117,6 +131,21 @@ class MetricsRegistry:
     def inc_ai_cache(self, metric: str):
         if metric in self._metrics["ai_cache"]:
             self._metrics["ai_cache"][metric] += 1
+
+    def observe_query_plan_cache(self, snapshot: Dict[str, Any]) -> None:
+        qpc = self._metrics.setdefault("query_plan_cache", {})
+        qpc["enabled"] = bool(snapshot.get("enabled", False))
+        qpc["max_entries"] = int(snapshot.get("max_entries", 0) or 0)
+        qpc["redis_entries"] = int(snapshot.get("redis_entries", 0) or 0)
+        qpc["scan_entries"] = int(snapshot.get("scan_entries", 0) or 0)
+        qpc["redis_hits"] = int(snapshot.get("redis_hits", 0) or 0)
+        qpc["redis_misses"] = int(snapshot.get("redis_misses", 0) or 0)
+        qpc["redis_cached"] = int(snapshot.get("redis_cached", 0) or 0)
+        qpc["redis_hit_ratio"] = float(snapshot.get("redis_hit_ratio", 0.0) or 0.0)
+        qpc["scan_hits"] = int(snapshot.get("scan_hits", 0) or 0)
+        qpc["scan_misses"] = int(snapshot.get("scan_misses", 0) or 0)
+        qpc["scan_cached"] = int(snapshot.get("scan_cached", 0) or 0)
+        qpc["scan_hit_ratio"] = float(snapshot.get("scan_hit_ratio", 0.0) or 0.0)
 
     def observe_replication_ack(
         self,

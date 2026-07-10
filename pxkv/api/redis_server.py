@@ -16,6 +16,7 @@ from ..auth import ROLE_ADMIN, ROLE_READER, ROLE_WRITER, best_role_for_secret, r
 from ..namespaces import namespace_manager
 from ..notifications import notifier
 from ..persistence.disk_throttle import disk_throttler
+from ..core.query_plan_cache import RedisCommandPlan, query_plan_cache
 
 def encode_simple_string(s: str) -> bytes:
     return f"+{s}\r\n".encode("utf-8")
@@ -154,7 +155,8 @@ class RedisServer(threading.Thread):
                 if not args:
                     continue
 
-                cmd = args[0].decode("utf-8", errors="replace").upper()
+                plan = query_plan_cache.redis_plan(args)
+                cmd = plan.cmd
                 if cmd in ("SUBSCRIBE", "UNSUBSCRIBE"):
                     if self._auth_enabled(namespace):
                         if role is None:
@@ -170,7 +172,7 @@ class RedisServer(threading.Thread):
                         if sub_sid is None:
                             sub_sid, sub_q = notifier.subscribe()
                         for i in range(1, len(args)):
-                            ch = args[i].decode("utf-8", errors="replace")
+                            ch = plan.str_args[i]
                             subs.add(ch)
                         resp = b""
                         for ch in subs:
@@ -183,7 +185,7 @@ class RedisServer(threading.Thread):
                             subs.clear()
                         else:
                             for i in range(1, len(args)):
-                                ch = args[i].decode("utf-8", errors="replace")
+                                ch = plan.str_args[i]
                                 subs.discard(ch)
                         resp = b""
                         if subs:
@@ -205,7 +207,7 @@ class RedisServer(threading.Thread):
                     conn.sendall(encode_error("ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING are allowed in this context"))
                     continue
 
-                response, role, namespace = self.handle_command(args, role, namespace)
+                response, role, namespace = self.handle_command(args, role, namespace, plan=plan)
                 conn.sendall(response)
         except Exception as e:
             logging.debug("Redis client error: %s", e)
@@ -235,8 +237,11 @@ class RedisServer(threading.Thread):
         args: List[bytes],
         role: Optional[str],
         namespace: Optional[str],
+        plan: Optional[RedisCommandPlan] = None,
     ) -> tuple[bytes, Optional[str], Optional[str]]:
-        cmd = args[0].decode("utf-8").upper()
+        plan = plan or query_plan_cache.redis_plan(args)
+        cmd = plan.cmd
+        sargs = plan.str_args
         start_time = time.time()
         registry.inc_requests(f"REDIS_{cmd}")
         namespace = namespace_manager.resolve(namespace) or namespace_manager.default()
@@ -278,7 +283,7 @@ class RedisServer(threading.Thread):
                     return encode_bulk_string(namespace), role, namespace
                 if len(args) != 2:
                     return encode_error("ERR wrong number of arguments for 'NAMESPACE' command"), role, namespace
-                candidate = namespace_manager.resolve(args[1].decode("utf-8", errors="replace"))
+                candidate = namespace_manager.resolve(sargs[1])
                 if candidate is None:
                     return encode_error("ERR invalid namespace"), role, namespace
                 return encode_simple_string(candidate), None, candidate
@@ -286,7 +291,7 @@ class RedisServer(threading.Thread):
             if cmd == "AUTH":
                 if len(args) not in (2, 3):
                     return encode_error("ERR wrong number of arguments for 'AUTH' command"), role, namespace
-                secret = args[-1].decode("utf-8", errors="replace")
+                secret = sargs[-1]
                 new_role = self._role_for_secret(secret, namespace) if self._auth_enabled(namespace) else ROLE_ADMIN
                 if new_role is None:
                     return encode_error("ERR invalid password"), role, namespace
@@ -298,17 +303,17 @@ class RedisServer(threading.Thread):
             elif cmd == "SET":
                 if len(args) < 3:
                     return encode_error("ERR wrong number of arguments for 'SET' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
-                val = args[2].decode("utf-8")
+                key = namespace_manager.key(namespace, sargs[1])
+                val = sargs[2]
                 ttl = None
                 i = 3
                 while i < len(args):
-                    opt = args[i].decode("utf-8").upper()
+                    opt = sargs[i].upper()
                     if opt == "EX" and i + 1 < len(args):
-                        ttl = float(args[i+1].decode("utf-8"))
+                        ttl = float(sargs[i + 1])
                         i += 2
                     elif opt == "PX" and i + 1 < len(args):
-                        ttl = float(args[i+1].decode("utf-8")) / 1000.0
+                        ttl = float(sargs[i + 1]) / 1000.0
                         i += 2
                     else:
                         break
@@ -323,7 +328,7 @@ class RedisServer(threading.Thread):
             elif cmd == "GET":
                 if len(args) != 2:
                     return encode_error("ERR wrong number of arguments for 'GET' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
+                key = namespace_manager.key(namespace, sargs[1])
                 try:
                     val = self.store.read(key)
                     return encode_bulk_string(val), role, namespace
@@ -335,7 +340,7 @@ class RedisServer(threading.Thread):
                     return encode_error("ERR wrong number of arguments for 'DEL' command"), role, namespace
                 count = 0
                 for i in range(1, len(args)):
-                    key = namespace_manager.key(namespace, args[i].decode("utf-8"))
+                    key = namespace_manager.key(namespace, sargs[i])
                     try:
                         self.store.delete(key)
                         count += 1
@@ -348,7 +353,7 @@ class RedisServer(threading.Thread):
                     return encode_error("ERR wrong number of arguments for 'EXISTS' command"), role, namespace
                 count = 0
                 for i in range(1, len(args)):
-                    key = namespace_manager.key(namespace, args[i].decode("utf-8"))
+                    key = namespace_manager.key(namespace, sargs[i])
                     try:
                         self.store.read(key)
                         count += 1
@@ -359,18 +364,18 @@ class RedisServer(threading.Thread):
             elif cmd in ("INCR", "INCRBY", "DECR", "DECRBY"):
                 if len(args) < 2:
                     return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
+                key = namespace_manager.key(namespace, sargs[1])
                 delta = 1.0
                 if cmd == "INCRBY":
                     if len(args) != 3:
                         return encode_error("ERR wrong number of arguments for 'INCRBY' command"), role, namespace
-                    delta = float(args[2].decode("utf-8"))
+                    delta = float(sargs[2])
                 elif cmd == "DECR":
                     delta = -1.0
                 elif cmd == "DECRBY":
                     if len(args) != 3:
                         return encode_error("ERR wrong number of arguments for 'DECRBY' command"), role, namespace
-                    delta = -float(args[2].decode("utf-8"))
+                    delta = -float(sargs[2])
                 
                 try:
                     new_val = self.store.incr(key, delta)
@@ -381,8 +386,8 @@ class RedisServer(threading.Thread):
             elif cmd == "EXPIRE":
                 if len(args) != 3:
                     return encode_error("ERR wrong number of arguments for 'EXPIRE' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
-                ttl = float(args[2].decode("utf-8"))
+                key = namespace_manager.key(namespace, sargs[1])
+                ttl = float(sargs[2])
                 try:
                     val = self.store.read(key)
                     self.store.update(key, val, ttl)
@@ -393,7 +398,7 @@ class RedisServer(threading.Thread):
             elif cmd in ("TTL", "PTTL"):
                 if len(args) != 2:
                     return encode_error(f"ERR wrong number of arguments for '{cmd}' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
+                key = namespace_manager.key(namespace, sargs[1])
                 try:
                     remaining = self.store.get_ttl(key)
                 except KeyError:
@@ -407,7 +412,7 @@ class RedisServer(threading.Thread):
             elif cmd == "PERSIST":
                 if len(args) != 2:
                     return encode_error("ERR wrong number of arguments for 'PERSIST' command"), role, namespace
-                key = namespace_manager.key(namespace, args[1].decode("utf-8"))
+                key = namespace_manager.key(namespace, sargs[1])
                 try:
                     cleared = self.store.persist(key)
                 except KeyError:

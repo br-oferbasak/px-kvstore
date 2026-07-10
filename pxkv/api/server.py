@@ -36,6 +36,7 @@ from .. import tracing
 from ..namespaces import NAMESPACE_HEADER, namespace_manager
 from ..persistence.disk_throttle import disk_throttler
 from ..persistence.gossip import initialize_gossip, get_gossip_membership
+from ..core.query_plan_cache import query_plan_cache
 
 def _server_ssl_context(cert_file: str, key_file: str) -> Optional[ssl.SSLContext]:
     if not cert_file or not key_file:
@@ -261,6 +262,11 @@ def _apply_runtime_config() -> None:
         threshold_count=getattr(settings, "HEAVY_HITTERS_THRESHOLD_COUNT", 0),
     )
 
+    query_plan_cache.configure(
+        enabled=getattr(settings, "QUERY_PLAN_CACHE_ENABLED", False),
+        max_entries=getattr(settings, "QUERY_PLAN_CACHE_MAX_ENTRIES", 1024),
+    )
+
     if settings.REDIS_ENABLED:
         if _REDIS_SERVER is None:
             _REDIS_SERVER = RedisServer(STORE, settings.REDIS_HOST, settings.REDIS_PORT)
@@ -374,6 +380,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             "POST /admin/hotkeys/reset",
             "GET /admin/heavy-hitters",
             "POST /admin/heavy-hitters/reset",
+            "POST /admin/query-plan-cache/reset",
             "GET /admin/adaptive-ttl",
             "POST /admin/adaptive-ttl/reset",
         ):
@@ -996,10 +1003,20 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._send(400, "limit must be int")
                         self._inc_metrics("GET", route="GET /kv/scan", error=True)
                         return
-                keys = STORE.scan(
-                    prefix=self._ns_prefix(namespace, prefix),
+                plan = query_plan_cache.scan_plan(
+                    namespace=namespace,
+                    prefix=prefix,
+                    start_after=start_after,
+                    cursor=None,
                     limit=limit,
-                    start_after=self._ns_key(namespace, start_after) if start_after else None,
+                    cursor_mode=False,
+                    ns_prefix_fn=self._ns_prefix,
+                    ns_key_fn=self._ns_key,
+                )
+                keys = STORE.scan(
+                    prefix=plan.storage_prefix,
+                    limit=plan.limit,
+                    start_after=plan.storage_start_after,
                 )
                 keys = [str(self._ns_strip(namespace, key)) for key in keys]
                 extra = getattr(self, "_fallback_headers", None)
@@ -1026,10 +1043,20 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         self._send(400, "limit must be int")
                         self._inc_metrics("GET", route="GET /kv/scan-cursor", error=True)
                         return
-                next_cursor, keys = STORE.scan_with_cursor(
+                plan = query_plan_cache.scan_plan(
+                    namespace=namespace,
+                    prefix=prefix,
+                    start_after=None,
                     cursor=cursor,
-                    prefix=self._ns_prefix(namespace, prefix),
                     limit=limit,
+                    cursor_mode=True,
+                    ns_prefix_fn=self._ns_prefix,
+                    ns_key_fn=self._ns_key,
+                )
+                next_cursor, keys = STORE.scan_with_cursor(
+                    cursor=plan.cursor,
+                    prefix=plan.storage_prefix,
+                    limit=plan.limit,
                 )
                 keys = [str(self._ns_strip(namespace, key)) for key in keys]
                 extra = getattr(self, "_fallback_headers", None)
@@ -1501,6 +1528,16 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._inc_metrics("POST", route="POST /admin/heavy-hitters/reset")
                 return
 
+            if parts == ["admin", "query-plan-cache", "reset"]:
+                if not self._rate_limit("POST /admin/query-plan-cache/reset"):
+                    return
+                if not self._require_role(ROLE_ADMIN):
+                    return
+                query_plan_cache.reset()
+                self._json(200, {"status": "ok"})
+                self._inc_metrics("POST", route="POST /admin/query-plan-cache/reset")
+                return
+
             if parts == ["admin", "adaptive-ttl", "reset"]:
                 if not self._rate_limit("POST /admin/adaptive-ttl/reset"):
                     return
@@ -1655,6 +1692,7 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             registry.observe_hot_keys(STORE._hotkeys.snapshot())
             registry.observe_namespace_hot_keys(self._hot_key_namespace_reports())
             registry.observe_heavy_hitters(STORE._heavy_hitters.snapshot())
+            registry.observe_query_plan_cache(query_plan_cache.snapshot())
             fmt = query.get("format", ["json"])[0]
             if fmt == "prometheus":
                 prom_data = registry_to_prometheus(registry.get_all())

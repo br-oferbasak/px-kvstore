@@ -126,6 +126,15 @@ export PXKV_NAMESPACE_CONFIGS='{
 
 Use `GET /admin/hotkeys?namespace=tenant-a` for one namespace or `GET /admin/hotkeys/namespaces` for all configured namespaces. Reports strip the internal namespace prefix from keys and expose `pxkv_namespace_hot_keys_*` Prometheus metrics.
 
+### **Query Plan Cache**
+Repeated Redis commands and scan requests can reuse parsed plans:
+```bash
+export PXKV_QUERY_PLAN_CACHE_ENABLED=true
+export PXKV_QUERY_PLAN_CACHE_MAX_ENTRIES=4096
+```
+
+The cache is bounded and stores parsed command/scan metadata, not values or query results. Inspect it through `/admin/metrics`, scrape `pxkv_query_plan_cache_*` Prometheus metrics, or clear it with `POST /admin/query-plan-cache/reset`.
+
 ---
 
 ## **Roadmap**
@@ -169,7 +178,7 @@ Use `GET /admin/hotkeys?namespace=tenant-a` for one namespace or `GET /admin/hot
 - [x] **Cold Key Eviction Hints**: Use access-frequency signal to bias LRU/LFU eviction toward truly cold keys.
 - [x] **Top-K Heavy Hitters via Count-Min Sketch**: Bounded-memory approximate hot-key tracking for high-cardinality workloads.
 - [x] **Per-Namespace Hot Key Reports**: Scope hot-key detection by namespace with separate thresholds and top-K lists.
-- [ ] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
+- [x] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
 - [ ] **Vector Indexing**: Native support for vector similarity search (HNSW) for embedding workloads.
 - [ ] **Snapshot Diff / Incremental Backup**: Ship only changed pages between snapshots to cut backup cost.
 
