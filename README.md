@@ -181,6 +181,14 @@ The cache is bounded and stores parsed command/scan metadata, not values or quer
 - [x] **Query Plan Cache**: Cache parsed Redis command pipelines and scan plans for repeated workloads.
 - [ ] **Vector Indexing**: Native support for vector similarity search (HNSW) for embedding workloads.
 - [ ] **Snapshot Diff / Incremental Backup**: Ship only changed pages between snapshots to cut backup cost.
+- [ ] **Redis Streams Compatibility**: Support XADD/XREAD/XGROUP-style event streams for log-like workloads.
+- [ ] **Lua / Server-Side Scripting**: Add atomic script execution for multi-key workflows.
+- [ ] **Online Backup Restore Preview**: Validate backup archives and estimate restore impact before applying.
+- [ ] **Shard Rebalancing Progress API**: Expose live migration progress, throttling, and cancellation controls.
+- [ ] **Per-Namespace Quotas**: Enforce tenant-level memory, key-count, and request-budget limits.
+- [ ] **Eviction Simulation Mode**: Preview which keys would be evicted under policy changes before enabling them.
+- [ ] **Read-Through Write-Behind Cache Adapters**: Integrate external databases with configurable consistency policies.
+- [ ] **Admin Audit Log**: Persist config changes, auth events, and privileged operations for compliance.
 
 ---
 
