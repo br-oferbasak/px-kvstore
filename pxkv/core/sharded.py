@@ -18,6 +18,7 @@ from .hotkey_mitigation import HotKeyMitigator
 from .adaptive_ttl import AdaptiveTTLController
 from .cold_eviction import ColdKeyEvictionHints
 from .heavy_hitters import TopKHeavyHitters
+from .vector import HNSWVectorIndex, normalize_vector
 from ..persistence.wal import WAL
 from ..persistence.replication import ReplicationManager
 from ..config.settings import settings
@@ -129,6 +130,12 @@ class ShardedKeyValueStore(object):
             compression_algorithm=getattr(settings, "COMPRESSION_ALGORITHM", "gzip"),
             compression_level=getattr(settings, "COMPRESSION_LEVEL", 6)
         )
+        self._vector_index = HNSWVectorIndex(
+            metric=getattr(settings, "VECTOR_INDEX_METRIC", "cosine"),
+            m=getattr(settings, "VECTOR_INDEX_M", 16),
+            ef_construction=getattr(settings, "VECTOR_INDEX_EF_CONSTRUCTION", 64),
+            ef_search=getattr(settings, "VECTOR_INDEX_EF_SEARCH", 64),
+        )
         self._replication = ReplicationManager(self)
         self._hotkeys = HotKeyDetector(
             enabled=getattr(settings, "HOT_KEY_DETECTION_ENABLED", False),
@@ -199,6 +206,7 @@ class ShardedKeyValueStore(object):
                     shard.purge_expired()
                 for k in keys:
                     notifier.publish("expire", k, lsn=int(getattr(self._wal, "_lsn", 0) or 0), shard=idx)
+                    self._vector_index.delete(k)
 
     def get_xmeta(self, key: Any) -> Optional[Dict[str, Any]]:
         """Get cross-cluster metadata for a key (origin_cluster_id, origin_ts)."""
@@ -476,6 +484,7 @@ class ShardedKeyValueStore(object):
             self._adaptive_ttl.forget(key)
             self._cold_eviction_hints.forget(key)
             self._heavy_hitters.forget(key)
+            self._vector_index.delete(key)
 
     def mget(self, keys: Iterable[Any]) -> Dict[Any, Any]:
         key_list = list(keys)
@@ -533,6 +542,98 @@ class ShardedKeyValueStore(object):
             shard = self._idx(key)
             notifier.publish("persist", key, lsn=lsn, shard=shard)
             return had_ttl
+
+    def vector_upsert(
+        self,
+        key: Any,
+        vector: Iterable[Any],
+        *,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+        origin_cluster_id: Optional[str] = None,
+        origin_ts: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        with self._write_lock:
+            vec = normalize_vector(vector)
+            self._vector_index.upsert(key, vec)
+            lsn = 0
+            if not skip_wal:
+                lsn = self._wal.log("vector_upsert", key, list(vec))
+            if not skip_replication:
+                self._replication.enqueue_change(
+                    "vector_upsert",
+                    key,
+                    list(vec),
+                    lsn=lsn,
+                    origin_cluster_id=origin_cluster_id or getattr(settings, "CLUSTER_ID", "local"),
+                    origin_ts=origin_ts if origin_ts is not None else time.time(),
+                )
+            return {"key": key, "dimension": len(vec), "lsn": lsn}
+
+    def vector_delete(
+        self,
+        key: Any,
+        *,
+        skip_wal: bool = False,
+        skip_replication: bool = False,
+    ) -> bool:
+        with self._write_lock:
+            deleted = self._vector_index.delete(key)
+            lsn = 0
+            if deleted and not skip_wal:
+                lsn = self._wal.log("vector_delete", key)
+            if deleted and not skip_replication:
+                self._replication.enqueue_change("vector_delete", key, lsn=lsn)
+            return deleted
+
+    def vector_get(self, key: Any) -> Optional[List[float]]:
+        vec = self._vector_index.get(key)
+        if vec is None:
+            return None
+        try:
+            self._bucket(key).read(key)
+        except KeyError:
+            self._vector_index.delete(key)
+            return None
+        return list(vec)
+
+    def vector_search(
+        self,
+        vector: Iterable[Any],
+        *,
+        k: int = 10,
+        ef: Optional[int] = None,
+        include_values: bool = False,
+    ) -> List[Dict[str, Any]]:
+        limit = max(0, int(k))
+        if limit == 0:
+            return []
+        raw = self._vector_index.search(vector, k=max(limit * 4, limit), ef=ef)
+        out: List[Dict[str, Any]] = []
+        stale: List[Any] = []
+        for item in raw:
+            key = item["key"]
+            try:
+                value = self._bucket(key).read(key)
+            except KeyError:
+                stale.append(key)
+                continue
+            result = {
+                "key": key,
+                "score": item["score"],
+                "distance": item["distance"],
+            }
+            if include_values:
+                result["value"] = value
+            out.append(result)
+            if len(out) >= limit:
+                break
+        for key in stale:
+            self._vector_index.delete(key)
+        return out
+
+    def vector_stats(self) -> Dict[str, Any]:
+        return self._vector_index.stats()
 
     def scan(
         self,
@@ -654,15 +755,19 @@ class ShardedKeyValueStore(object):
 
     def dump(self) -> Dict[str, Dict[str, Any]]:
         with self._write_lock:
-            return {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+            data = {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+            data["_vectors"] = self._vector_index.dump()
+            return data
 
     def dump_with_lsn(self) -> tuple[int, Dict[str, Dict[str, Any]]]:
         with self._write_lock:
             lsn = int(getattr(self._wal, "_lsn", 0) or 0)
             data = {str(i): shard.dump_state() for i, shard in enumerate(self._shards)}
+            data["_vectors"] = self._vector_index.dump()
             return lsn, data
 
     def load(self, data: Dict[str, Dict[str, Any]]) -> None:
+        vectors = data.get("_vectors") if isinstance(data, dict) else None
         for idx_str, shard_data in data.items():
             try:
                 idx = int(idx_str)
@@ -670,6 +775,12 @@ class ShardedKeyValueStore(object):
                 continue
             if 0 <= idx < len(self._shards):
                 self._shards[idx].load_state(shard_data)
+        self._vector_index.clear()
+        if isinstance(vectors, dict):
+            try:
+                self._vector_index.load(vectors)
+            except Exception:
+                self._vector_index.clear()
 
     def reshard(self, new_shards: int) -> dict:
         """

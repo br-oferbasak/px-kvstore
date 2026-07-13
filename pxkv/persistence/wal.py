@@ -273,6 +273,10 @@ def recover_from_wal(store, wal: WAL):
                             store.persist(key, skip_wal=True, skip_replication=True)
                         except KeyError:
                             pass
+                    elif op == "vector_upsert":
+                        store.vector_upsert(key, val, skip_wal=True, skip_replication=True)
+                    elif op == "vector_delete":
+                        store.vector_delete(key, skip_wal=True, skip_replication=True)
                 except Exception as e:
                     logging.warning("Failed to recover entry: %s", e)
         wal._lsn = max_lsn

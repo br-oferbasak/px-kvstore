@@ -132,6 +132,45 @@ def test_sse_keyspace_notifications(http_server):
     assert ev["key"] == "sse_test_key"
 
 
+def test_vector_upsert_search_get_delete(http_server):
+    def post(path, payload):
+        req = urllib.request.Request(
+            f"{http_server}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+
+    status, body = post(
+        "/vector/upsert",
+        {"key": "doc-a", "vector": [1, 0, 0], "value": {"text": "alpha"}},
+    )
+    assert status == 201
+    assert body["dimension"] == 3
+    post("/vector/upsert", {"key": "doc-b", "vector": [0.95, 0.05, 0], "value": {"text": "beta"}})
+    post("/vector/upsert", {"key": "doc-c", "vector": [0, 1, 0], "value": {"text": "gamma"}})
+
+    status, body = post("/vector/search", {"vector": [1, 0, 0], "k": 2, "include_values": True})
+    assert status == 200
+    assert [item["key"] for item in body["results"]] == ["doc-a", "doc-b"]
+    assert body["results"][0]["value"] == {"text": "alpha"}
+
+    with urllib.request.urlopen(f"{http_server}/vector/doc-a", timeout=2.0) as resp:
+        assert resp.status == 200
+        got = json.loads(resp.read().decode("utf-8"))
+    assert got == {"key": "doc-a", "vector": [1.0, 0.0, 0.0]}
+
+    req = urllib.request.Request(f"{http_server}/vector/doc-a", method="DELETE")
+    with urllib.request.urlopen(req, timeout=2.0) as resp:
+        assert resp.status == 204
+
+    status, body = post("/vector/search", {"vector": [1, 0, 0], "k": 1})
+    assert status == 200
+    assert body["results"][0]["key"] == "doc-b"
+
+
 def test_rate_limiting_per_route_admin_configurable():
     port = get_free_port()
     env = os.environ.copy()

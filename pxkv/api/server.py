@@ -751,8 +751,12 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
         lsn, data = STORE.dump_with_lsn()
         _write_line({"_lsn": int(lsn), "shards": settings.SHARDS})
-        for idx_str, shard_state in sorted(data.items(), key=lambda kv: int(kv[0])):
+        vector_state = data.get("_vectors")
+        shard_items = [(k, v) for k, v in data.items() if str(k).isdigit()]
+        for idx_str, shard_state in sorted(shard_items, key=lambda kv: int(kv[0])):
             _write_line({"shard": int(idx_str), "state": shard_state})
+        if isinstance(vector_state, dict):
+            _write_line({"vectors": vector_state})
 
         try:
             if compress:
@@ -920,6 +924,29 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 if not self._require_role(ROLE_ADMIN):
                     return
                 self._handle_admin_get(parts[1:], query)
+                return
+
+            if parts[0] == "vector":
+                namespace = self._namespace_or_400(query)
+                if namespace is None:
+                    self._inc_metrics("GET", route="GET /vector/:key", error=True)
+                    return
+                if not self._rate_limit("GET /vector/:key", namespace=namespace):
+                    return
+                if not self._require_role(ROLE_READER, namespace=namespace):
+                    return
+                if len(parts) == 2 and parts[1] == "stats":
+                    self._json(200, STORE.vector_stats(), headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("GET", route="GET /vector/stats")
+                    return
+                if len(parts) != 2 or not parts[1]:
+                    raise ValueError
+                key = parts[1]
+                vector = STORE.vector_get(self._ns_key(namespace, key))
+                if vector is None:
+                    raise KeyError(key)
+                self._json(200, {"key": key, "vector": vector}, headers=self._with_namespace_headers({}, namespace))
+                self._inc_metrics("GET", route="GET /vector/:key")
                 return
 
             if parts[0] == "ai":
@@ -1189,6 +1216,13 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             if settings.REPLICATION_ROLE == "follower":
                 self._reject_readonly(route="DELETE /kv/:key")
                 return
+            if len(parts) == 2 and parts[0] == "vector" and parts[1] != "":
+                deleted = STORE.vector_delete(self._ns_key(namespace, parts[1]))
+                if not deleted:
+                    raise KeyError(parts[1])
+                self._send(204, headers=self._with_namespace_headers({}, namespace))
+                self._inc_metrics("DELETE", route="DELETE /vector/:key")
+                return
             if len(parts) != 2 or parts[0] != "kv" or parts[1] == "":
                 raise ValueError
             STORE.delete(self._ns_key(namespace, parts[1]))
@@ -1426,6 +1460,106 @@ class KVHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     registry.inc_ai_cache("stores")
                     self._json(201, {"key": key, "canonical": canon}, headers=self._with_namespace_headers({}, namespace))
                     self._inc_metrics("POST", route="POST /ai/cache")
+                    return
+
+            if len(parts) >= 1 and parts[0] == "vector":
+                if parts == ["vector", "search"]:
+                    namespace = self._namespace_or_400(query)
+                    if namespace is None:
+                        self._inc_metrics("POST", route="POST /vector/search", error=True)
+                        return
+                    if not self._rate_limit("POST /vector/search", namespace=namespace):
+                        return
+                    if not self._require_role(ROLE_READER, namespace=namespace):
+                        return
+                    payload = json.loads(self._body() or b"{}")
+                    vector = payload.get("vector")
+                    k = payload.get("k", 10)
+                    ef = payload.get("ef")
+                    include_values = bool(payload.get("include_values", False))
+                    if not isinstance(vector, list):
+                        self._send(400, "vector must be an array")
+                        self._inc_metrics("POST", route="POST /vector/search", error=True)
+                        return
+                    try:
+                        k_i = int(k)
+                        ef_i = None if ef is None else int(ef)
+                        results = STORE.vector_search(vector, k=k_i, ef=ef_i, include_values=include_values)
+                    except ValueError as e:
+                        self._send(400, str(e))
+                        self._inc_metrics("POST", route="POST /vector/search", error=True)
+                        return
+                    scoped = []
+                    ns_prefix = self._ns_prefix(namespace)
+                    for item in results:
+                        key = item.get("key")
+                        if isinstance(key, str) and key.startswith(ns_prefix):
+                            entry = dict(item)
+                            entry["key"] = self._ns_strip(namespace, key)
+                            scoped.append(entry)
+                    self._json(200, {"results": scoped}, headers=self._with_namespace_headers({}, namespace))
+                    self._inc_metrics("POST", route="POST /vector/search")
+                    return
+
+                if parts == ["vector", "upsert"]:
+                    namespace = self._namespace_or_400(query)
+                    if namespace is None:
+                        self._inc_metrics("POST", route="POST /vector/upsert", error=True)
+                        return
+                    if not self._rate_limit("POST /vector/upsert", namespace=namespace):
+                        return
+                    if not self._require_role(ROLE_WRITER, namespace=namespace):
+                        return
+                    if settings.REPLICATION_ROLE == "follower":
+                        self._reject_readonly(route="POST /vector/upsert")
+                        return
+                    if not self._enforce_disk_write_budget("POST /vector/upsert"):
+                        return
+                    payload = json.loads(self._body() or b"{}")
+                    key = payload.get("key")
+                    vector = payload.get("vector")
+                    ttl = payload.get("ttl")
+                    value_supplied = "value" in payload
+                    value = payload.get("value")
+                    metadata = payload.get("metadata")
+                    if not isinstance(key, str) or not key:
+                        self._send(400, "key must be a non-empty string")
+                        self._inc_metrics("POST", route="POST /vector/upsert", error=True)
+                        return
+                    if not isinstance(vector, list):
+                        self._send(400, "vector must be an array")
+                        self._inc_metrics("POST", route="POST /vector/upsert", error=True)
+                        return
+                    ttl_f = None
+                    if ttl is not None:
+                        try:
+                            ttl_f = float(ttl)
+                        except (TypeError, ValueError):
+                            self._send(400, "ttl must be numeric")
+                            self._inc_metrics("POST", route="POST /vector/upsert", error=True)
+                            return
+                    storage_key = self._ns_key(namespace, key)
+                    if not value_supplied:
+                        value = {"embedding": vector, "metadata": metadata or {}}
+                    exists = storage_key in STORE.mget([storage_key])
+                    try:
+                        info = STORE.vector_upsert(storage_key, vector)
+                    except ValueError as e:
+                        self._send(400, str(e))
+                        self._inc_metrics("POST", route="POST /vector/upsert", error=True)
+                        return
+                    if exists:
+                        STORE.update(storage_key, value, ttl_f)
+                        status = 200
+                    else:
+                        STORE.create(storage_key, value, ttl_f)
+                        status = 201
+                    self._json(
+                        status,
+                        {"key": key, "dimension": info["dimension"]},
+                        headers=self._with_namespace_headers({}, namespace),
+                    )
+                    self._inc_metrics("POST", route="POST /vector/upsert")
                     return
 
             if len(parts) >= 3 and parts[0] == "kv" and parts[1] == "incr":

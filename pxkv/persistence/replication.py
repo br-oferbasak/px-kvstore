@@ -236,6 +236,12 @@ class ReplicationManager:
                             if not line:
                                 break
                             rec = json.loads(line.decode("utf-8", errors="replace"))
+                            if "vectors" in rec and isinstance(rec.get("vectors"), dict):
+                                try:
+                                    self.store._vector_index.load(rec["vectors"])
+                                except Exception:
+                                    logging.warning("Failed to load vector index from snapshot")
+                                continue
                             shard_idx = rec.get("shard")
                             state = rec.get("state")
                             if shard_idx is None or state is None:
@@ -533,6 +539,16 @@ class ReplicationManager:
                         self.store.persist(key, skip_replication=True)
                     except KeyError:
                         pass
+                elif op == "vector_upsert":
+                    self.store.vector_upsert(
+                        key,
+                        val,
+                        skip_replication=True,
+                        origin_cluster_id=origin_cluster_id,
+                        origin_ts=origin_ts,
+                    )
+                elif op == "vector_delete":
+                    self.store.vector_delete(key, skip_replication=True)
 
                 self._last_applied_lsn = lsn
                 last_applied = True

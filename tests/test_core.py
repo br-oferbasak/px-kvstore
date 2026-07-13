@@ -92,6 +92,38 @@ class TestShardedStore:
         k2 = "user:{42}:settings"
         assert sharded_store.shard_for_key(k1) == sharded_store.shard_for_key(k2)
 
+    def test_vector_search_hnsw(self, sharded_store):
+        sharded_store.create("doc-a", {"text": "alpha"})
+        sharded_store.create("doc-b", {"text": "beta"})
+        sharded_store.create("doc-c", {"text": "gamma"})
+        sharded_store.vector_upsert("doc-a", [1.0, 0.0, 0.0])
+        sharded_store.vector_upsert("doc-b", [0.9, 0.1, 0.0])
+        sharded_store.vector_upsert("doc-c", [0.0, 1.0, 0.0])
+
+        results = sharded_store.vector_search([1.0, 0.0, 0.0], k=2, include_values=True)
+        assert [r["key"] for r in results] == ["doc-a", "doc-b"]
+        assert results[0]["score"] >= results[1]["score"]
+        assert results[0]["value"] == {"text": "alpha"}
+
+    def test_vector_delete_and_snapshot_load(self, sharded_store):
+        sharded_store.create("doc-a", "alpha")
+        sharded_store.create("doc-b", "beta")
+        sharded_store.vector_upsert("doc-a", [1.0, 0.0])
+        sharded_store.vector_upsert("doc-b", [0.0, 1.0])
+        assert sharded_store.vector_delete("doc-b") is True
+
+        loaded = ShardedKeyValueStore(shards=3, per_shard_max=5)
+        loaded.load(sharded_store.dump())
+        assert loaded.vector_get("doc-a") == [1.0, 0.0]
+        assert loaded.vector_get("doc-b") is None
+        assert loaded.vector_search([1.0, 0.0], k=1)[0]["key"] == "doc-a"
+
+    def test_vector_search_filters_deleted_kv(self, sharded_store):
+        sharded_store.create("doc-a", "alpha")
+        sharded_store.vector_upsert("doc-a", [1.0, 0.0])
+        sharded_store.delete("doc-a")
+        assert sharded_store.vector_search([1.0, 0.0], k=1) == []
+
 
 def test_tiering_spill_and_promote_lru():
     with tempfile.TemporaryDirectory() as d:

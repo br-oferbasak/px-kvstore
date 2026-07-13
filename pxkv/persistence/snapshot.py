@@ -270,6 +270,10 @@ def recover_to_lsn(store, target_lsn: int, snapshot_path: str, wal_path: str) ->
                             store.persist(key, skip_wal=True, skip_replication=True)
                         except KeyError:
                             pass
+                    elif op == "vector_upsert":
+                        store.vector_upsert(key, val, skip_wal=True, skip_replication=True)
+                    elif op == "vector_delete":
+                        store.vector_delete(key, skip_wal=True, skip_replication=True)
                     max_applied_lsn = max(max_applied_lsn, lsn)
                 except Exception as e:
                     logging.warning("PITR failed to apply entry LSN %d: %s", lsn, e)
