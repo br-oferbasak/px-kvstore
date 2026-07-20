@@ -8,9 +8,199 @@ import threading
 import time
 import glob
 import gzip
-from typing import Optional
+import hashlib
+import re
+import binascii
+from typing import Any, Dict, Optional
 
 from ..config.settings import settings
+
+_DIFF_FORMAT = "pxkv-page-diff-v1"
+
+
+def _json_default(v: Any):
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="replace")
+    raise TypeError
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, default=_json_default, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _page_hash(page: Dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(page).encode("utf-8")).hexdigest()
+
+
+def _read_json(path: str) -> Dict[str, Any]:
+    if path.endswith(".gz"):
+        with gzip.open(path, "rt") as f:
+            return json.load(f)
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def _write_json_atomic(path: str, payload: Dict[str, Any]) -> None:
+    if path.endswith(".gz"):
+        tmp = f"{path}.tmp"
+        with gzip.open(tmp, "wt", compresslevel=int(getattr(settings, "COMPRESSION_LEVEL", 6))) as f:
+            json.dump(payload, f, default=_json_default)
+        os.replace(tmp, path)
+        return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, default=_json_default)
+    os.replace(tmp, path)
+
+
+def _archive_lsn(path: str) -> Optional[int]:
+    m = re.search(r"\.(\d+)\.\d+\.archive(?:\.diff)?(?:\.gz)?$", path)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _base_path_from_archive(path: str) -> str:
+    return re.sub(r"\.\d+\.\d+\.archive(?:\.diff)?(?:\.gz)?$", "", path)
+
+
+def _archive_path(base_path: str, lsn: int, ts: int, *, diff: bool = False) -> str:
+    path = f"{base_path}.{lsn}.{ts}.archive"
+    if diff:
+        path += ".diff"
+    if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
+        path += ".gz"
+    return path
+
+
+def _page_bucket(key: Any, buckets: int) -> int:
+    raw = key.encode("utf-8", errors="replace") if isinstance(key, str) else str(key).encode("utf-8", errors="replace")
+    return binascii.crc32(raw) % max(1, int(buckets))
+
+
+def _payload_to_pages(payload: Dict[str, Any], buckets: int) -> Dict[str, Dict[str, Any]]:
+    pages: Dict[str, Dict[str, Any]] = {}
+    for top_key, value in payload.items():
+        if top_key in ("_lsn", "_ts", "_snapshot_format", "_snapshot_diff"):
+            continue
+        if str(top_key).isdigit() and isinstance(value, dict):
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for key, rec in value.items():
+                bucket = _page_bucket(key, buckets)
+                grouped.setdefault(bucket, {})[key] = rec
+            for bucket, items in grouped.items():
+                page_id = f"shard:{top_key}:bucket:{bucket}"
+                pages[page_id] = {"kind": "shard", "shard": str(top_key), "items": items}
+        elif top_key.startswith("_"):
+            page_id = f"meta:{top_key}"
+            pages[page_id] = {"kind": "meta", "key": top_key, "value": value}
+    return pages
+
+
+def _pages_to_payload(pages: Dict[str, Dict[str, Any]], *, lsn: int, ts: float) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"_lsn": int(lsn), "_ts": ts}
+    for page in pages.values():
+        if not isinstance(page, dict):
+            continue
+        if page.get("kind") == "shard":
+            shard = str(page.get("shard", ""))
+            if not shard.isdigit():
+                continue
+            payload.setdefault(shard, {}).update(page.get("items", {}) or {})
+        elif page.get("kind") == "meta":
+            key = page.get("key")
+            if isinstance(key, str) and key.startswith("_"):
+                payload[key] = page.get("value")
+    return payload
+
+
+def _manifest_for_pages(pages: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    return {page_id: _page_hash(page) for page_id, page in pages.items()}
+
+
+def _find_archive_by_lsn(base_path: str, target_lsn: int) -> Optional[str]:
+    for fpath, lsn in list_snapshot_archives(base_path):
+        if int(lsn) == int(target_lsn):
+            return fpath
+    return None
+
+
+def _diff_base_lsn(path: str) -> Optional[int]:
+    try:
+        data = _read_json(path)
+    except Exception:
+        return None
+    if data.get("_snapshot_format") != _DIFF_FORMAT:
+        return None
+    try:
+        return int(data.get("base_lsn", 0) or 0)
+    except Exception:
+        return None
+
+
+def _load_snapshot_payload(path: str) -> Dict[str, Any]:
+    data = _read_json(path)
+    if data.get("_snapshot_format") != _DIFF_FORMAT:
+        return data
+
+    base_lsn = int(data.get("base_lsn", 0) or 0)
+    base_path = _base_path_from_archive(path)
+    base_archive = _find_archive_by_lsn(base_path, base_lsn)
+    if not base_archive:
+        raise ValueError(f"base snapshot archive for LSN {base_lsn} not found")
+
+    base_payload = _load_snapshot_payload(base_archive)
+    buckets = int(data.get("page_buckets", getattr(settings, "SNAPSHOT_DIFF_PAGE_BUCKETS", 256)) or 256)
+    pages = _payload_to_pages(base_payload, buckets)
+    for page_id in data.get("deleted_pages", []) or []:
+        pages.pop(page_id, None)
+    for page_id, page in (data.get("pages", {}) or {}).items():
+        pages[page_id] = page
+
+    expected = data.get("manifest", {}) or {}
+    actual = _manifest_for_pages(pages)
+    if expected and expected != actual:
+        raise ValueError("snapshot diff manifest verification failed")
+    return _pages_to_payload(pages, lsn=int(data.get("_lsn", 0) or 0), ts=float(data.get("_ts", 0.0) or 0.0))
+
+
+def _build_diff_payload(payload: Dict[str, Any], base_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    buckets = int(getattr(settings, "SNAPSHOT_DIFF_PAGE_BUCKETS", 256) or 256)
+    current_pages = _payload_to_pages(payload, buckets)
+    base_pages = _payload_to_pages(base_payload, buckets)
+    current_manifest = _manifest_for_pages(current_pages)
+    base_manifest = _manifest_for_pages(base_pages)
+
+    changed_pages = {
+        page_id: current_pages[page_id]
+        for page_id, digest in current_manifest.items()
+        if base_manifest.get(page_id) != digest
+    }
+    deleted_pages = sorted(page_id for page_id in base_manifest.keys() if page_id not in current_manifest)
+
+    if not changed_pages and not deleted_pages:
+        return None
+
+    return {
+        "_snapshot_format": _DIFF_FORMAT,
+        "_lsn": int(payload.get("_lsn", 0) or 0),
+        "_ts": float(payload.get("_ts", 0.0) or 0.0),
+        "base_lsn": int(base_payload.get("_lsn", 0) or 0),
+        "page_buckets": buckets,
+        "manifest": current_manifest,
+        "pages": changed_pages,
+        "deleted_pages": deleted_pages,
+        "stats": {
+            "changed_pages": len(changed_pages),
+            "deleted_pages": len(deleted_pages),
+            "total_pages": len(current_pages),
+            "base_pages": len(base_pages),
+        },
+    }
+
 
 def load_snapshot(store, path: str) -> bool:
     if not path:
@@ -24,12 +214,7 @@ def load_snapshot(store, path: str) -> bool:
     if not os.path.exists(file_to_read):
         return False
     try:
-        if file_to_read.endswith(".gz"):
-            with gzip.open(file_to_read, "rt") as f:
-                data = json.load(f)
-        else:
-            with open(file_to_read, "r") as f:
-                data = json.load(f)
+        data = _load_snapshot_payload(file_to_read)
         if isinstance(data, dict) and "_lsn" in data:
             try:
                 store._wal._lsn = max(int(store._wal._lsn), int(data.get("_lsn", 0) or 0))
@@ -57,14 +242,8 @@ def list_snapshot_archives(base_path: str) -> list:
     files = glob.glob(pattern)
     for fpath in files:
         try:
-            parts = fpath.split(".")
-            lsn_idx = None
-            for i, part in enumerate(parts):
-                if part == "archive":
-                    lsn_idx = i - 1
-                    break
-            if lsn_idx is not None and lsn_idx >= 0 and parts[lsn_idx].isdigit():
-                lsn = int(parts[lsn_idx])
+            lsn = _archive_lsn(fpath)
+            if lsn is not None:
                 archives.append((fpath, lsn))
         except Exception:
             pass
@@ -78,7 +257,27 @@ def prune_snapshot_archives(base_path: str, keep: int) -> None:
         return
     archives = list_snapshot_archives(base_path)
     if len(archives) > keep:
-        for fpath, _ in archives[keep:]:
+        protected = {fpath for fpath, _ in archives[:keep]}
+
+        # Diff archives are only useful with their base chain. Preserve those
+        # dependencies even when doing so slightly exceeds the configured keep.
+        changed = True
+        while changed:
+            changed = False
+            for fpath, _ in archives:
+                if fpath not in protected:
+                    continue
+                base_lsn = _diff_base_lsn(fpath)
+                if base_lsn is None:
+                    continue
+                base_path_for_diff = _find_archive_by_lsn(base_path, base_lsn)
+                if base_path_for_diff and base_path_for_diff not in protected:
+                    protected.add(base_path_for_diff)
+                    changed = True
+
+        for fpath, _ in archives:
+            if fpath in protected:
+                continue
             try:
                 os.remove(fpath)
                 logging.info("Pruned old snapshot archive: %s", fpath)
@@ -101,12 +300,7 @@ def find_snapshot_for_lsn(base_path: str, target_lsn: int) -> Optional[str]:
             file_to_check = base_path
     if os.path.exists(file_to_check):
         try:
-            if file_to_check.endswith(".gz"):
-                with gzip.open(file_to_check, "rt") as f:
-                    data = json.load(f)
-            else:
-                with open(file_to_check, "r") as f:
-                    data = json.load(f)
+            data = _load_snapshot_payload(file_to_check)
             lsn = int(data.get("_lsn", 0) or 0)
             if lsn <= target_lsn:
                 return file_to_check
@@ -134,30 +328,43 @@ class SnapshotManager(threading.Thread):
             payload["_ts"] = time.time()
             
             if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
-                tmp_gz = f"{self.path}.tmp.gz"
-                with gzip.open(tmp_gz, "wt", compresslevel=int(getattr(settings, "COMPRESSION_LEVEL", 6))) as f:
-                    json.dump(payload, f)
-                os.replace(tmp_gz, self.path + ".gz")
+                _write_json_atomic(self.path + ".gz", payload)
                 logging.info("Saved compressed snapshot to %s.gz", self.path)
             else:
-                with open(tmp, "w") as f:
-                    json.dump(payload, f)
-                os.replace(tmp, self.path)
+                _write_json_atomic(self.path, payload)
                 logging.info("Saved snapshot to %s", self.path)
             
             # Also save an archived version if PITR is enabled
             if getattr(settings, "PITR_ENABLED", True):
                 try:
                     ts = int(time.time())
-                    archive_path = f"{self.path}.{lsn}.{ts}.archive"
-                    if getattr(settings, "COMPRESSION_ENABLED", False) and getattr(settings, "COMPRESSION_ALGORITHM", "gzip") == "gzip":
-                        archive_path_gz = archive_path + ".gz"
-                        with gzip.open(archive_path_gz, "wt", compresslevel=int(getattr(settings, "COMPRESSION_LEVEL", 6))) as f:
-                            json.dump(payload, f)
-                        logging.info("Saved compressed snapshot archive to %s", archive_path_gz)
+                    archive_payload = payload
+                    archive_path = _archive_path(self.path, int(lsn), ts, diff=False)
+                    if getattr(settings, "SNAPSHOT_DIFF_ENABLED", False):
+                        previous = None
+                        for fpath, prev_lsn in list_snapshot_archives(self.path):
+                            if int(prev_lsn) < int(lsn):
+                                previous = fpath
+                                break
+                        if previous:
+                            try:
+                                base_payload = _load_snapshot_payload(previous)
+                                diff_payload = _build_diff_payload(payload, base_payload)
+                                if diff_payload is not None:
+                                    archive_payload = diff_payload
+                                    archive_path = _archive_path(self.path, int(lsn), ts, diff=True)
+                            except Exception as e:
+                                logging.warning("Failed to build snapshot diff archive, falling back to full archive: %s", e)
+                    _write_json_atomic(archive_path, archive_payload)
+                    if archive_payload.get("_snapshot_format") == _DIFF_FORMAT:
+                        stats = archive_payload.get("stats", {})
+                        logging.info(
+                            "Saved snapshot diff archive to %s (changed_pages=%s total_pages=%s)",
+                            archive_path,
+                            stats.get("changed_pages"),
+                            stats.get("total_pages"),
+                        )
                     else:
-                        with open(archive_path, "w") as f:
-                            json.dump(payload, f)
                         logging.info("Saved snapshot archive to %s", archive_path)
                     keep = int(getattr(settings, "PITR_SNAPSHOT_KEEP", 5))
                     prune_snapshot_archives(self.path, keep)
@@ -172,7 +379,7 @@ class SnapshotManager(threading.Thread):
                     logging.warning("WAL rotation failed: %s", e)
         except Exception as e:
             logging.error("Failed to save snapshot: %s", e)
-            for tmp_file in [tmp, f"{self.path}.tmp.gz"]:
+            for tmp_file in [tmp, f"{self.path}.tmp.gz", f"{self.path}.gz.tmp"]:
                 if os.path.exists(tmp_file):
                     try:
                         os.remove(tmp_file)
@@ -325,8 +532,7 @@ def recover_to_timestamp(store, target_ts: float, snapshot_path: str, wal_path: 
         # If no WAL, try to find the best snapshot
         if snapshot_path and os.path.exists(snapshot_path):
             try:
-                with open(snapshot_path, "r") as f:
-                    data = json.load(f)
+                data = _load_snapshot_payload(snapshot_path)
                 snapshot_ts = data.get("_ts", 0.0)
                 if snapshot_ts <= target_ts:
                     load_snapshot(store, snapshot_path)
@@ -337,8 +543,7 @@ def recover_to_timestamp(store, target_ts: float, snapshot_path: str, wal_path: 
         archives = list_snapshot_archives(snapshot_path)
         for fpath, _ in archives:
             try:
-                with open(fpath, "r") as f:
-                    data = json.load(f)
+                data = _load_snapshot_payload(fpath)
                 snapshot_ts = data.get("_ts", 0.0)
                 if snapshot_ts <= target_ts:
                     load_snapshot(store, fpath)

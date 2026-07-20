@@ -31,6 +31,8 @@ class Settings:
 
             self.SNAPSHOT_FILE = os.getenv("PXKV_SNAPSHOT_FILE", "")
             self.SNAPSHOT_INTERVAL = float(os.getenv("PXKV_SNAPSHOT_INTERVAL", "0"))
+            self.SNAPSHOT_DIFF_ENABLED = os.getenv("PXKV_SNAPSHOT_DIFF_ENABLED", "false").lower() == "true"
+            self.SNAPSHOT_DIFF_PAGE_BUCKETS = int(os.getenv("PXKV_SNAPSHOT_DIFF_PAGE_BUCKETS", "256") or "256")
             self.WAL_FILE = os.getenv("PXKV_WAL_FILE", "")
             self.WAL_ROTATE_ENABLED = os.getenv("PXKV_WAL_ROTATE_ENABLED", "false").lower() == "true"
             self.WAL_ROTATE_KEEP = int(os.getenv("PXKV_WAL_ROTATE_KEEP", "0") or "0")
